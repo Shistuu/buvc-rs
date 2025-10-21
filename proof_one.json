@@ -1,0 +1,29 @@
+{
+  "block_number": 14795866,
+  "block_hash": "0xb05643c5fce9af5f5d20393c7f6240c11d8f157d93ada6545ab063413cd73c9b",
+  "n": 65536,
+  "srs_id": "blake3:ae9a4d679d2090d27bc21710faa3733ebd06220bc5b5e5fd52ce91139a59be70",
+  "gc_b": "0x88e393ff83535769e8e53659fc38a5ccb98307568d3f0768f68d49619d5ade50acf6a984837a31d74e58c3c4db27be5f",
+  "indices": [
+    0
+  ],
+  "addresses": [
+    "0x000000000dfde7deaf24138722987c9a6991e2d4"
+  ],
+  "balances_wei": [
+    "32504120284850316443"
+  ],
+  "single_proofs": [
+    {
+      "index": 0,
+      "address": "0x000000000dfde7deaf24138722987c9a6991e2d4",
+      "balance_wei": "32504120284850316443",
+      "gq_hex": "0x9333466e3ab24eb913ac99fe5e90ecb52d9127d8520c1e03837895d255af00c119962b9a19657a2954c4c29695df8229",
+      "value_hex": "0x9b6412532fd515c3010000000000000000000000000000000000000000000000"
+    }
+  ],
+  "aggregated_proof_hex": "0x9333466e3ab24eb913ac99fe5e90ecb52d9127d8520c1e03837895d255af00c119962b9a19657a2954c4c29695df8229",
+  "verify_multi_ok": true,
+  "update_same": null,
+  "update_different": null
+}

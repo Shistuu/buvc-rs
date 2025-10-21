@@ -12,6 +12,7 @@ ark-poly = { version = "0.4.0" }
 ark-serialize = { version = "0.4.0", features = ["derive"] }
 log = { version = "0.4.21" }
 rayon = "1.10"
+rand = "0.8"
 
 [dev-dependencies]
 clap = "4.5.4"
@@ -29,3 +30,33 @@ harness = false
 
 [profile.bench]
 debug = true
+
+# ---------------------------------------------------------------------
+# extra crates required only for the cauchy_erigon_runner binary
+[dependencies.ethers]
+version = "2"
+features = ["ipc"]
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "macros"]
+
+[dependencies.clap]
+version = "4"
+features = ["derive"]
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+
+[dependencies.serde_json]
+version = "1"
+
+[dependencies.hex]
+version = "0.4"
+
+[dependencies.blake3]
+version = "1"
+
+[dependencies.color-eyre]
+version = "0.6"
