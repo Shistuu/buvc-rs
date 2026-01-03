@@ -1,0 +1,14 @@
+# Rust build
+target/
+
+# Large artifacts / datasets / logs (don't commit)
+*.bin
+*.json
+*.txt
+*.log
+run_*.log
+
+# Explicit big files in this repo
+srs.bin
+snapshot_state_*.json
+universe_*.txt
