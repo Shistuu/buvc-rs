@@ -3,7 +3,7 @@ use crate::codec::keccak_hex;
 use crate::vc_context::VcContext;
 use crate::vc_parameter::VcParameter;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use eyre::{Result, bail};
+use eyre::{bail, Result};
 use std::{fs, path::Path};
 
 pub fn load_or_create_srs(path: &Path, logn: usize) -> Result<(VcParameter, String)> {
@@ -25,7 +25,10 @@ pub fn load_or_create_srs(path: &Path, logn: usize) -> Result<(VcParameter, Stri
     }
 
     // create
-    eprintln!("SRS: {:?} not found, generating new SRS (logn={})…", path, logn);
+    eprintln!(
+        "SRS: {:?} not found, generating new SRS (logn={})…",
+        path, logn
+    );
     let mut rng = ark_std::test_rng();
 
     let (_trap, vp) = VcParameter::new(logn, &mut rng);

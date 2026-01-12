@@ -107,7 +107,10 @@ impl SegmentReader {
         idx_file.read_to_end(&mut idx_bytes)?;
 
         if idx_bytes.len() % 8 != 0 {
-            bail!("Index file corrupt: size {} not multiple of 8", idx_bytes.len());
+            bail!(
+                "Index file corrupt: size {} not multiple of 8",
+                idx_bytes.len()
+            );
         }
 
         let n_offsets = idx_bytes.len() / 8;
@@ -142,10 +145,19 @@ impl SegmentReader {
 
     fn get_block(&mut self, block: u32) -> Result<Vec<Entry>> {
         if block < self.base || block > self.end {
-            bail!("Block {} out of segment range [{}, {}]", block, self.base, self.end);
+            bail!(
+                "Block {} out of segment range [{}, {}]",
+                block,
+                self.base,
+                self.end
+            );
         }
         if block > self.last_written {
-            bail!("Block {} not built yet (last built {})", block, self.last_written);
+            bail!(
+                "Block {} not built yet (last built {})",
+                block,
+                self.last_written
+            );
         }
 
         let i = (block - self.base) as usize;

@@ -3,8 +3,8 @@ use crate::types::JournalLine;
 use eyre::Result;
 use std::{
     collections::BTreeMap,
-    fs::OpenOptions,
-    io::{BufRead, Write},
+    fs::{File, OpenOptions},
+    io::{BufRead, BufReader, Write},
     path::Path,
 };
 
@@ -23,8 +23,8 @@ pub fn iter_lines_filtered<P: AsRef<Path>>(
     if !path.as_ref().exists() {
         return Ok(Vec::new());
     }
-    let f = std::fs::File::open(path)?;
-    let rd = std::io::BufReader::new(f);
+    let f = File::open(path)?;
+    let rd = BufReader::new(f);
     let mut out = Vec::new();
     for line in rd.lines() {
         let l = line?;
@@ -39,13 +39,48 @@ pub fn iter_lines_filtered<P: AsRef<Path>>(
     Ok(out)
 }
 
+/// Stream journal lines one-by-one (avoids loading entire journal into RAM).
+/// Applies the same filters as iter_lines_filtered.
+pub fn for_each_line_filtered<F>(
+    journal_path: &Path,
+    srs_id: &str,
+    n: usize,
+    logn: usize,
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut(JournalLine) -> Result<()>,
+{
+    if !journal_path.exists() {
+        return Ok(());
+    }
+    let file = File::open(journal_path)?;
+    let rd = BufReader::new(file);
+
+    for line in rd.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let j: JournalLine = serde_json::from_str(line)?;
+        if j.srs_id != srs_id || j.n != n || j.logn != logn {
+            continue;
+        }
+
+        f(j)?;
+    }
+    Ok(())
+}
+
 /// Return whether a journal entry for `block` already exists.
 /// If both existing and new are pinned (Some), enforce equality.
 pub fn already_pinned_block(
     lines: &[JournalLine],
     block: u64,
     gc_hex: &Option<String>,
-) -> eyre::Result<bool> {
+) -> Result<bool> {
     for j in lines {
         if j.block_number == block {
             match (&j.gc_hex, gc_hex) {
@@ -59,7 +94,7 @@ pub fn already_pinned_block(
                         );
                     }
                 }
-                _ => { /* unpinned => don't enforce */ }
+                _ => {}
             }
             return Ok(true);
         }

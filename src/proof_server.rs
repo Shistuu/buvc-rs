@@ -1,110 +1,131 @@
 // src/proof_server.rs
-use std::collections::{BTreeMap, HashMap};
 
-use ark_bls12_381::{fr::Fr, G1Projective as G1};
-use ark_ff::Zero;
-use eyre::{bail, Result};
-use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
 
-use crate::codec::{g1_from_hex, g1_to_hex};
-use crate::types::UserState;
+use serde::{Serialize, Deserialize};
+use eyre::{Result, bail};
+
+use ark_bls12_381::{G1Projective as G1, fr::Fr};
+use ark_ff::{Field, Zero};
+
+use crate::codec::{g1_from_hex, g1_to_hex, fr_from_hex, fr_to_hex};
+use crate::types::{UserState, JournalLine};
 use crate::vc_context::VcContext;
+use crate::history::{HistoryOp, vupdate_history_same_alpha};
+use crate::journal::for_each_line_filtered;
 
-/// A single logical user of the proof server, identified however you like.
-/// We store the indices this user cares about (same meaning as in UserState).
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/* ============================================================
+ * Helpers
+ * ============================================================ */
+
+pub fn canonicalize_beta_delta(
+    beta: &[usize],
+    delta: &[Fr],
+) -> (Vec<usize>, Vec<Fr>) {
+    use std::collections::BTreeMap;
+
+    let mut acc: BTreeMap<usize, Fr> = BTreeMap::new();
+    for (&i, &d) in beta.iter().zip(delta.iter()) {
+        if !d.is_zero() {
+            *acc.entry(i).or_insert(Fr::ZERO) += d;
+        }
+    }
+    acc.into_iter().unzip()
+}
+
+/* ============================================================
+ * Proof-server data structures
+ * ============================================================ */
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProofServerUser {
     pub user_id: String,
     pub alpha_indices: Vec<usize>,
 }
 
-/// State of a proof-serving node that maintains proofs for the *union* of
-/// all α-sets across many users.
-///
-/// This is the "multi-user" object the paper talks about: a single
-/// vector of proofs that is updated once per block and can be used
-/// to answer proofs for any registered user.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProofServerState {
     pub n: usize,
     pub logn: usize,
     pub srs_id: String,
 
+    /// Latest block server is synced to
     pub last_block: u64,
+
+    /// Commitment at last_block
     pub gc_hex: String,
 
-    /// Union of all user indices (sorted, unique).
+    /// UNION α across all users
     pub alpha_indices: Vec<usize>,
-    /// Witnesses for `alpha_indices`, same order.
+
+    /// Witnesses for UNION α at last_block
     pub alpha_witnesses_hex: Vec<String>,
 
-    /// Logical users and which indices they care about.
-    pub users: Vec<ProofServerUser>,
+    /// Values for UNION α at last_block (hex-encoded Fr)
+    pub alpha_values_hex: Vec<String>,
 
-    pub universe_mode: String,
-    pub witness_mode: String, // e.g. "user_maintains_witnesses_vupdate"
+    pub users: Vec<ProofServerUser>,
 }
 
+/* ============================================================
+ * Construction
+ * ============================================================ */
+
 impl ProofServerState {
-    /// Construct a proof-server state from a collection of (user_id, UserState).
-    ///
-    /// All user states must:
-    ///   - Share the same n, logn, srs_id, last_block, gc_hex,
-    ///     universe_mode, witness_mode.
-    ///   - Have consistent witnesses for overlapping indices.
-    pub fn from_user_states(users: &[(String, UserState)]) -> Result<Self> {
+    pub fn from_user_states(
+        users: &[(String, UserState)],
+    ) -> Result<Self> {
         if users.is_empty() {
-            bail!("need at least one user to build ProofServerState");
+            bail!("ProofServerInit: no users");
         }
 
-        let (_, first) = &users[0];
-        let n = first.n;
-        let logn = first.logn;
-        let srs_id = first.srs_id.clone();
-        let last_block = first.last_block;
-        let gc_hex = first.gc_hex.clone();
-        let universe_mode = first.universe_mode.clone();
-        let witness_mode = first.witness_mode.clone();
+        let base = &users[0].1;
 
-        // Sanity-check invariants across all users.
-        for (_, u) in users.iter().skip(1) {
-            if u.n != n
-                || u.logn != logn
-                || u.srs_id != srs_id
-                || u.last_block != last_block
-                || u.gc_hex != gc_hex
-                || u.universe_mode != universe_mode
-                || u.witness_mode != witness_mode
-            {
-                bail!("inconsistent UserState; cannot merge into a single proof server");
-            }
-        }
-
-        // Build union of indices with canonical witnesses.
-        // For each index i, we remember one witness and check all others match.
-        let mut index_to_wit: BTreeMap<usize, G1> = BTreeMap::new();
+        let mut union_alpha = Vec::<usize>::new();
+        let mut wit_map: HashMap<usize, String> = HashMap::new();
+        let mut val_map: HashMap<usize, String> = HashMap::new();
 
         for (_, u) in users {
-            for (idx, wit_hex) in u.alpha_indices.iter().zip(u.alpha_witnesses_hex.iter()) {
-                let g = g1_from_hex(wit_hex)?;
-                match index_to_wit.get(idx) {
-                    Some(existing) => {
-                        if existing != &g {
-                            bail!("inconsistent witness for index {} across users", idx);
-                        }
-                    }
-                    None => {
-                        index_to_wit.insert(*idx, g);
-                    }
-                }
+            if u.n != base.n || u.logn != base.logn || u.srs_id != base.srs_id {
+                bail!("user_state invariant mismatch");
+            }
+            if u.last_block != base.last_block || u.gc_hex != base.gc_hex {
+                bail!("user_states not aligned at same block");
+            }
+
+            for (i, &idx) in u.alpha_indices.iter().enumerate() {
+                union_alpha.push(idx);
+                wit_map
+                    .entry(idx)
+                    .or_insert_with(|| u.alpha_witnesses_hex[i].clone());
+                val_map
+                    .entry(idx)
+                    .or_insert_with(|| u.alpha_values_hex[i].clone());
             }
         }
 
-        let alpha_indices: Vec<usize> = index_to_wit.keys().copied().collect();
-        let alpha_witnesses_hex: Vec<String> =
-            index_to_wit.values().map(|g| g1_to_hex(g)).collect();
+        union_alpha.sort_unstable();
+        union_alpha.dedup();
 
-        let users_desc = users
+        let mut alpha_witnesses_hex = Vec::with_capacity(union_alpha.len());
+        let mut alpha_values_hex = Vec::with_capacity(union_alpha.len());
+        for &idx in &union_alpha {
+            alpha_witnesses_hex.push(
+                wit_map
+                    .get(&idx)
+                    .ok_or_else(|| eyre::eyre!("missing witness {}", idx))?
+                    .clone(),
+            );
+            alpha_values_hex.push(
+                val_map
+                    .get(&idx)
+                    .ok_or_else(|| eyre::eyre!("missing value {}", idx))?
+                    .clone(),
+            );
+        }
+
+        let users_out = users
             .iter()
             .map(|(id, u)| ProofServerUser {
                 user_id: id.clone(),
@@ -113,96 +134,223 @@ impl ProofServerState {
             .collect();
 
         Ok(Self {
-            n,
-            logn,
-            srs_id,
-            last_block,
-            gc_hex,
-            alpha_indices,
+            n: base.n,
+            logn: base.logn,
+            srs_id: base.srs_id.clone(),
+            last_block: base.last_block,
+            gc_hex: base.gc_hex.clone(),
+            alpha_indices: union_alpha,
             alpha_witnesses_hex,
-            users: users_desc,
-            universe_mode,
-            witness_mode,
+            alpha_values_hex,
+            users: users_out,
         })
     }
 
-    /// Apply a single block's updates (β, Δ) to *all* users at once.
-    ///
-    /// This is the multi-user VUpdate: the proof server only calls
-    /// update_witnesses_batch once on the union of all α, then each
-    /// user can be served from the updated vector.
+    /* ============================================================
+     * Online forward maintenance
+     * ============================================================ */
+
     pub fn apply_update(
         &mut self,
         ctx: &VcContext,
         beta: &[usize],
         delta: &[Fr],
-        new_block: u64,
-        new_gc_hex: &str,
+        block: u64,
+        pinned_gc: Option<&str>,
     ) -> Result<()> {
-        if beta.len() != delta.len() {
-            bail!("beta/delta length mismatch");
-        }
-        if new_block <= self.last_block {
-            bail!(
-                "new_block {} must be > last_block {}",
-                new_block,
-                self.last_block
-            );
-        }
-
-        // Decode witnesses to G1.
-        let mut gq: Vec<G1> = Vec::with_capacity(self.alpha_witnesses_hex.len());
-        for hx in &self.alpha_witnesses_hex {
-            gq.push(g1_from_hex(hx)?);
-        }
-
-        // Update commitment and witnesses, mirroring your vupdate_step.
         let mut gc = g1_from_hex(&self.gc_hex)?;
+
+        // Update global commitment
         for (&i, &d) in beta.iter().zip(delta.iter()) {
             if !d.is_zero() {
                 gc = ctx.update_commitment(gc, i, d);
             }
         }
 
-        // Batch update all maintained proofs.
-        let gq_new = ctx.update_witnesses_batch(&self.alpha_indices, &gq, beta, delta);
-
-        // Check against publisher-pinned commitment, if provided.
-        if !new_gc_hex.is_empty() {
-            let pinned = new_gc_hex.trim();
-            if pinned != g1_to_hex(&gc) {
-                bail!("commitment mismatch in proof server at block {}", new_block);
+        if let Some(p) = pinned_gc {
+            if g1_to_hex(&gc) != p {
+                bail!("commitment mismatch at block {}", block);
             }
         }
 
-        // Persist.
-        self.last_block = new_block;
-        self.gc_hex = g1_to_hex(&gc);
-        self.alpha_witnesses_hex = gq_new.iter().map(g1_to_hex).collect();
+        // Update union-α witnesses if necessary
+        if !beta.is_empty() && !self.alpha_indices.is_empty() {
+            let mut gq = Vec::<G1>::with_capacity(self.alpha_witnesses_hex.len());
+            for hx in &self.alpha_witnesses_hex {
+                gq.push(g1_from_hex(hx)?);
+            }
 
+            gq = ctx.update_witnesses_batch(
+                &self.alpha_indices,
+                &gq,
+                beta,
+                delta,
+            );
+
+            self.alpha_witnesses_hex = gq.iter().map(g1_to_hex).collect();
+        }
+
+        // Update union-α values (server-tracked balances)
+        if !beta.is_empty() && !self.alpha_indices.is_empty() {
+            let mut pos = HashMap::<usize, usize>::new();
+            for (i, &idx) in self.alpha_indices.iter().enumerate() {
+                pos.insert(idx, i);
+            }
+
+            for (&b, &d) in beta.iter().zip(delta.iter()) {
+                if let Some(&p) = pos.get(&b) {
+                    let mut v = fr_from_hex(&self.alpha_values_hex[p])?;
+                    v += d;
+                    self.alpha_values_hex[p] = fr_to_hex(&v);
+                }
+            }
+        }
+
+        self.gc_hex = g1_to_hex(&gc);
+        self.last_block = block;
         Ok(())
     }
 
-    /// Serve one user's current witnesses as (indices, witnesses_hex).
-    ///
-    /// The caller can then pair these with values to form SingleProofs
-    /// or aggregated proofs, exactly like your existing UserQuery.
-    pub fn serve_user(&self, user_id: &str) -> Option<(Vec<usize>, Vec<String>)> {
-        let user = self.users.iter().find(|u| u.user_id == user_id)?;
-        // Build a map from global index -> position in alpha_indices.
-        let pos: HashMap<usize, usize> = self
-            .alpha_indices
-            .iter()
-            .enumerate()
-            .map(|(i, idx)| (*idx, i))
-            .collect();
+    /* ============================================================
+     * Serve current head proofs
+     * ============================================================ */
 
-        let mut wits = Vec::with_capacity(user.alpha_indices.len());
-        for idx in &user.alpha_indices {
-            let p = *pos.get(idx)?;
-            wits.push(self.alpha_witnesses_hex[p].clone());
+    pub fn serve_user(
+        &self,
+        user_id: &str,
+    ) -> Option<(Vec<usize>, Vec<String>, Vec<String>)> {
+        let user = self.users.iter().find(|u| u.user_id == user_id)?;
+
+        let mut pos = HashMap::new();
+        for (i, &idx) in self.alpha_indices.iter().enumerate() {
+            pos.insert(idx, i);
         }
 
-        Some((user.alpha_indices.clone(), wits))
+        let mut idxs = Vec::new();
+        let mut wits = Vec::new();
+        let mut vals = Vec::new();
+
+        for &i in &user.alpha_indices {
+            let p = *pos.get(&i)?;
+            idxs.push(i);
+            wits.push(self.alpha_witnesses_hex[p].clone());
+            vals.push(self.alpha_values_hex[p].clone());
+        }
+
+        Some((idxs, vals, wits))
+    }
+
+    /// Return (user_alpha_indices, positions in union-α vector)
+    pub fn user_alpha(
+        &self,
+        user_id: &str,
+    ) -> Option<(Vec<usize>, Vec<usize>)> {
+        let user = self.users.iter().find(|u| u.user_id == user_id)?;
+
+        let mut pos = HashMap::<usize, usize>::new();
+        for (i, &idx) in self.alpha_indices.iter().enumerate() {
+            pos.insert(idx, i);
+        }
+
+        let mut positions = Vec::new();
+        for &idx in &user.alpha_indices {
+            let p = *pos.get(&idx)?;
+            positions.push(p);
+        }
+
+        Some((user.alpha_indices.clone(), positions))
+    }
+
+    /* ============================================================
+     * Historical range query (paper-faithful)
+     * ============================================================ */
+
+    pub fn history_query_same_alpha(
+        &self,
+        ctx: &VcContext,
+        journal: &Path,
+        start_block: u64,
+        mut blocks: Vec<u64>,
+    ) -> Result<Vec<(u64, Vec<G1>)>> {
+        blocks.sort_unstable();
+        blocks.dedup();
+
+        if blocks.is_empty() {
+            bail!("no query blocks");
+        }
+        if start_block >= self.last_block {
+            bail!("start_block >= last_block");
+        }
+
+        let mut gq_final = Vec::<G1>::new();
+        for hx in &self.alpha_witnesses_hex {
+            gq_final.push(g1_from_hex(hx)?);
+        }
+
+        let mut ops_fwd = Vec::<HistoryOp>::new();
+        let mut qid_to_block = Vec::<u64>::new();
+        let mut qpos = 0usize;
+
+        for_each_line_filtered(
+            journal,
+            &self.srs_id,
+            self.n,
+            self.logn,
+            |j: JournalLine| -> Result<()> {
+                let b = j.block_number;
+                if b <= start_block || b > self.last_block {
+                    return Ok(());
+                }
+
+                let mut delta = Vec::<Fr>::new();
+                for hx in &j.delta_hex {
+                    delta.push(fr_from_hex(hx)?);
+                }
+
+                let (beta, delta) =
+                    canonicalize_beta_delta(&j.changed_indices, &delta);
+
+                if !beta.is_empty() {
+                    ops_fwd.push(HistoryOp::Update { beta, delta });
+                }
+
+                while qpos < blocks.len() && blocks[qpos] < b {
+                    qpos += 1;
+                }
+                if qpos < blocks.len() && blocks[qpos] == b {
+                    let qid = qid_to_block.len();
+                    ops_fwd.push(HistoryOp::Query { query_id: qid });
+                    qid_to_block.push(b);
+                    qpos += 1;
+                }
+
+                Ok(())
+            },
+        )?;
+
+        let mut ops_rev = ops_fwd;
+        ops_rev.reverse();
+        for op in ops_rev.iter_mut() {
+            if let HistoryOp::Update { delta, .. } = op {
+                for d in delta.iter_mut() {
+                    *d = -*d;
+                }
+            }
+        }
+
+        let results = vupdate_history_same_alpha(
+            ctx,
+            &self.alpha_indices,
+            &gq_final,
+            &ops_rev,
+        );
+
+        let mut out = Vec::new();
+        for r in results {
+            out.push((qid_to_block[r.query_id], r.proofs));
+        }
+
+        out.sort_by_key(|(b, _)| *b);
+        Ok(out)
     }
 }

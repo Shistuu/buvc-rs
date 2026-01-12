@@ -75,7 +75,7 @@ pub struct UserState {
     pub alpha_witnesses_hex: Vec<String>, // G1 compressed hex, aligned with alpha_indices
 
     pub universe_mode: String,
-    pub value_mode: String, // "user_maintains_values_forward"
+    pub value_mode: String,   // "user_maintains_values_forward"
     pub witness_mode: String, // "user_maintains_witnesses_vupdate"
 }
 

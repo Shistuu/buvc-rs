@@ -9,7 +9,6 @@ use eyre::Result;
 use serde::Deserialize;
 use serde_json::json;
 
-
 #[derive(Debug, Deserialize)]
 struct AccountRangeAccount {
     address: Option<String>,
@@ -58,8 +57,8 @@ pub async fn dump_universe_at_block(
             format!("0x{:x}", block_num),
             start.clone().unwrap_or_default(),
             page,
-            true,  // preimages
-            true,  // accounts
+            true, // preimages
+            true, // accounts
         ]);
 
         // Some rpcdaemon variants wrap the result, so request as Value first.

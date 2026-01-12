@@ -7,10 +7,10 @@ pub mod codec;
 pub mod dataset;
 pub mod dataset_helpers;
 pub mod erigon;
+pub mod history;
 pub mod indexer;
 pub mod journal;
+pub mod proof_server;
+pub mod snapshot_vals;
 pub mod srs;
 pub mod types;
-pub mod history;
-pub mod proof_server;
-

@@ -160,6 +160,69 @@ impl VcContext {
         gc + gl[index] * (value * unity[index * step] / nf)
     }
 
+    /// Build commitment and witnesses ONLY for the requested indices `alpha`.
+    /// Paper-faithful: for any i in alpha, the returned witness equals what
+    /// build_commitment(v).1[i] would have been.
+    pub fn build_commitment_for_alpha(&self, v: &[Fr], alpha: &[usize]) -> (G1, Vec<G1>) {
+        let n = v.len();
+        assert!(self.n == n);
+
+        // sanity: bounds
+        for &i in alpha {
+            assert!(i < n, "alpha index {} out of range (n={})", i, n);
+        }
+
+        let nf = self.nf;
+        let unity = &self.unity;
+        let gl = &self.gl;
+        let gll = &self.gll;
+        let step = unity.len() / n;
+
+        // Same as build_commitment up to producing `a` and `b`.
+        let mut a: Vec<Fr> = (0..n).map(|i| v[i] * unity[i * step] / nf).collect();
+
+        // NOTE: we still need `b` as a length-n Vec<G1> because FFT/IFFT is over the full vector.
+        let mut b: Vec<G1> = (0..n)
+            .map(|i| gl[i] * (v[i] * unity[i * step] / nf))
+            .collect();
+
+        // Commitment is the sum BEFORE FFT, exactly as in build_commitment.
+        let gc = b.iter().sum();
+
+        poly_fft(unity, &mut a, n);
+        poly_fft(unity, &mut b, n);
+
+        let tau: Vec<Fr> = (0..n)
+            .map(|i| (nf - Fr::from((i * 2 + 1) as u32)) / Fr::from(2))
+            .collect();
+
+        a = a.into_iter().zip(&tau).map(|(i, j)| i * j).collect();
+        b = b.into_iter().zip(&tau).map(|(i, j)| i * j).collect();
+
+        poly_ifft(unity, &mut a, n);
+        poly_ifft(unity, &mut b, n);
+
+        a = a
+            .into_iter()
+            .zip(unity.iter().step_by(step))
+            .map(|(i, j)| i * (Fr::ONE / j))
+            .collect();
+
+        b = b
+            .into_iter()
+            .zip(unity.iter().step_by(step))
+            .map(|(i, j)| i * (Fr::ONE / j))
+            .collect();
+
+        // Now compute witnesses ONLY for alpha, using the exact same formula.
+        let gq_alpha: Vec<G1> = alpha
+            .iter()
+            .map(|&i| gll[i] * (v[i] * unity[i * step] / nf) + gl[i] * a[i] - b[i])
+            .collect();
+
+        (gc, gq_alpha)
+    }
+
     pub fn update_witnesses_batch(
         &self,
         alpha: &[usize], // Indices of the proofs
@@ -222,7 +285,7 @@ impl VcContext {
                 .collect::<Vec<Fr>>();
             let updated_gq = self.update_witnesses_batch_same(&m_alpha, &m_gq, &m_value);
             for i in common_alpha.iter().zip(updated_gq.iter()) {
-                result[i.0.1] = *i.1;
+                result[i.0 .1] = *i.1;
             }
             if !beta_extra.is_empty() {
                 let m_alpha = common_alpha
@@ -241,7 +304,7 @@ impl VcContext {
                 let updated_gq =
                     self.update_witnesses_batch_different(&m_alpha, &m_gq, &m_beta, &m_value);
                 for i in common_alpha.iter().zip(updated_gq.iter()) {
-                    result[i.0.1] = *i.1;
+                    result[i.0 .1] = *i.1;
                 }
             }
         }
@@ -257,7 +320,7 @@ impl VcContext {
             let updated_gq =
                 self.update_witnesses_batch_different(&m_alpha, &m_gq, m_beta, m_value);
             for i in alpha_extra.iter().zip(updated_gq.iter()) {
-                result[i.0.1] = *i.1;
+                result[i.0 .1] = *i.1;
             }
         }
 

@@ -1,263 +1,256 @@
-// src/history.rs
-use std::collections::{BTreeMap, BTreeSet};
-
 use ark_bls12_381::{fr::Fr, G1Projective as G1};
-use ark_ff::{Field, Zero};
+use ark_ff::{Zero};
 
 use crate::vc_context::VcContext;
 
-/// One element of the (already reversed + negated) history stream S, as in §2.5:
-///   - UPDATE(β_i, Δv_{β_i})
-///   - QUERY(α_j)
-///
-/// NOTE: This is now the *general* form: each query carries its own α-set.
-/// The caller is responsible for ensuring α_j ⊆ α_all (the union) and
-/// that the final witnesses they pass in correspond to α_all at the final state.
 #[derive(Clone, Debug)]
 pub enum HistoryOp {
-    /// UPDATE(β, Δ) in the *reversed* stream.
-    /// Precondition: deltas are already negated compared to forward time.
-    Update {
-        beta: Vec<usize>, // indices in [0..N)
-        delta: Vec<Fr>,   // aligned with beta
-    },
-
-    /// QUERY at some logical point in the stream.
-    /// query_id is an opaque handle; α is the indices whose proofs we want.
-    Query {
-        query_id: usize,
-        alpha: Vec<usize>, // indices whose proofs are requested for this query
-    },
+    Update { beta: Vec<usize>, delta: Vec<Fr> },
+    Query { query_id: usize },
 }
 
-/// Result for a single history query: indices α_j and their witnesses.
+/// Result for a single history query: indices α and their witnesses.
 #[derive(Clone, Debug)]
 pub struct HistoryQueryResult {
     pub query_id: usize,
-    pub indices: Vec<usize>, // α_j
-    pub proofs: Vec<G1>,     // witnesses for α_j, same order as indices
+    pub indices: Vec<usize>, // α
+    pub proofs: Vec<G1>,     // witnesses for α, same order
 }
 
-/// Combine duplicate indices by summing deltas. Keeps ascending order.
-fn canonicalize_beta_delta(beta: &[usize], delta: &[Fr]) -> (Vec<usize>, Vec<Fr>) {
-    let mut acc: BTreeMap<usize, Fr> = BTreeMap::new();
-    for (&i, &d) in beta.iter().zip(delta.iter()) {
-        if d.is_zero() {
-            continue;
+fn merge_beta_delta(
+    beta_a: &[usize],
+    delta_a: &[Fr],
+    beta_b: &[usize],
+    delta_b: &[Fr],
+) -> (Vec<usize>, Vec<Fr>) {
+    debug_assert_eq!(beta_a.len(), delta_a.len());
+    debug_assert_eq!(beta_b.len(), delta_b.len());
+
+    let mut out_b = Vec::with_capacity(beta_a.len() + beta_b.len());
+    let mut out_d = Vec::with_capacity(beta_a.len() + beta_b.len());
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < beta_a.len() && j < beta_b.len() {
+        let ba = beta_a[i];
+        let bb = beta_b[j];
+        if ba == bb {
+            let d = delta_a[i] + delta_b[j];
+            if !d.is_zero() {
+                out_b.push(ba);
+                out_d.push(d);
+            }
+            i += 1;
+            j += 1;
+        } else if ba < bb {
+            if !delta_a[i].is_zero() {
+                out_b.push(ba);
+                out_d.push(delta_a[i]);
+            }
+            i += 1;
+        } else {
+            if !delta_b[j].is_zero() {
+                out_b.push(bb);
+                out_d.push(delta_b[j]);
+            }
+            j += 1;
         }
-        *acc.entry(i).or_insert(Fr::ZERO) += d;
     }
-    acc.into_iter().unzip()
+    while i < beta_a.len() {
+        if !delta_a[i].is_zero() {
+            out_b.push(beta_a[i]);
+            out_d.push(delta_a[i]);
+        }
+        i += 1;
+    }
+    while j < beta_b.len() {
+        if !delta_b[j].is_zero() {
+            out_b.push(beta_b[j]);
+            out_d.push(delta_b[j]);
+        }
+        j += 1;
+    }
+
+    (out_b, out_d)
 }
 
-/// Internal recursive VUpdate(S, α⃗) as in the paper (Section 2.5 / Section 7).
-///
-/// - `alpha_live` are the indices whose proofs we currently maintain at this
-///   node in the recursion (this is α⃗ for this substream).
-/// - `gq_live` are the witnesses for `alpha_live`, same order.
-/// - `stream` is the (reversed+negated) subsequence S for this node.
-///
-/// Invariant: for every QUERY in `stream`, its α_j ⊆ alpha_live.
-fn vupdate_inner(
+/// Canonicalize a (beta,delta) by sorting and summing duplicates.
+/// This is used at UPDATE leaves (typically tiny per-block).
+fn canonicalize_beta_delta(beta: &[usize], delta: &[Fr]) -> (Vec<usize>, Vec<Fr>) {
+    debug_assert_eq!(beta.len(), delta.len());
+
+    // beta sizes per block are small; O(k log k) here is fine
+    let mut pairs: Vec<(usize, Fr)> = beta.iter().copied().zip(delta.iter().copied()).collect();
+    pairs.sort_by_key(|(b, _)| *b);
+
+    let mut out_b: Vec<usize> = Vec::with_capacity(pairs.len());
+    let mut out_d: Vec<Fr> = Vec::with_capacity(pairs.len());
+
+    let mut i = 0usize;
+    while i < pairs.len() {
+        let b = pairs[i].0;
+        let mut acc = pairs[i].1;
+        i += 1;
+        while i < pairs.len() && pairs[i].0 == b {
+            acc += pairs[i].1;
+            i += 1;
+        }
+        if !acc.is_zero() {
+            out_b.push(b);
+            out_d.push(acc);
+        }
+    }
+
+    (out_b, out_d)
+}
+
+#[derive(Clone, Debug)]
+struct Node {
+    l: usize,
+    r: usize, // [l, r)
+    has_query: bool,
+
+    // merged updates (β,Δ) for updates in [l,r), sorted by β, unique
+    beta: Vec<usize>,
+    delta: Vec<Fr>,
+
+    left: Option<Box<Node>>,
+    right: Option<Box<Node>>,
+}
+
+fn build_node(stream: &[HistoryOp], l: usize, r: usize) -> Node {
+    debug_assert!(l < r);
+
+    if r - l == 1 {
+        match &stream[l] {
+            HistoryOp::Query { .. } => Node {
+                l,
+                r,
+                has_query: true,
+                beta: Vec::new(),
+                delta: Vec::new(),
+                left: None,
+                right: None,
+            },
+            HistoryOp::Update { beta, delta } => {
+                let (b, d) = canonicalize_beta_delta(beta, delta);
+                Node {
+                    l,
+                    r,
+                    has_query: false,
+                    beta: b,
+                    delta: d,
+                    left: None,
+                    right: None,
+                }
+            }
+        }
+    } else {
+        let m = l + (r - l) / 2;
+        let left = build_node(stream, l, m);
+        let right = build_node(stream, m, r);
+
+        let has_query = left.has_query || right.has_query;
+        let (beta, delta) = merge_beta_delta(&left.beta, &left.delta, &right.beta, &right.delta);
+
+        Node {
+            l,
+            r,
+            has_query,
+            beta,
+            delta,
+            left: Some(Box::new(left)),
+            right: Some(Box::new(right)),
+        }
+    }
+}
+
+/// Paper-faithful recursion:
+/// - recurse left with current witnesses
+/// - update witnesses by left updates
+/// - recurse right with updated witnesses
+fn vupdate_run(
     ctx: &VcContext,
-    alpha_live: &[usize],
-    gq_live: &[G1],
     stream: &[HistoryOp],
+    node: &Node,
+    alpha_all: &[usize],
+    gq_live: &[G1],
     out: &mut Vec<HistoryQueryResult>,
 ) {
-    if stream.is_empty() {
+    if !node.has_query {
         return;
     }
 
-    // Base case: |S| = 1
-    if stream.len() == 1 {
-        if let HistoryOp::Query { query_id, alpha } = &stream[0] {
-            if alpha.is_empty() {
-                // nothing requested; still return a result with empty proofs
-                out.push(HistoryQueryResult {
-                    query_id: *query_id,
-                    indices: Vec::new(),
-                    proofs: Vec::new(),
-                });
-                return;
-            }
-
-            // Map: index -> position in alpha_live
-            let mut pos: BTreeMap<usize, usize> = BTreeMap::new();
-            for (p, &idx) in alpha_live.iter().enumerate() {
-                pos.insert(idx, p);
-            }
-
-            let mut proofs = Vec::<G1>::with_capacity(alpha.len());
-            for &i in alpha {
-                let p = pos
-                    .get(&i)
-                    .expect("query alpha index not in alpha_live (invariant broken)");
-                proofs.push(gq_live[*p]);
-            }
-
+    // leaf
+    if node.r - node.l == 1 {
+        if let HistoryOp::Query { query_id } = &stream[node.l] {
             out.push(HistoryQueryResult {
                 query_id: *query_id,
-                indices: alpha.clone(),
-                proofs,
+                indices: alpha_all.to_vec(),
+                proofs: gq_live.to_vec(),
             });
         }
-        // If it's an UPDATE-only singleton, nothing to output.
         return;
     }
 
-    // Split S into S_l and S_r at m = floor(|S| / 2).
-    let m = stream.len() / 2;
-    let (s_l, s_r) = stream.split_at(m);
+    let left = node.left.as_ref().expect("internal node missing left");
+    let right = node.right.as_ref().expect("internal node missing right");
 
-    // Compute α_l and α_r as unions of α_j for queries in S_l / S_r.
-    let mut alpha_l_set: BTreeSet<usize> = BTreeSet::new();
-    let mut alpha_r_set: BTreeSet<usize> = BTreeSet::new();
-    let mut has_query_l = false;
-    let mut has_query_r = false;
+    // Left recurse (no witness changes before left)
+    if left.has_query {
+        vupdate_run(ctx, stream, left, alpha_all, gq_live, out);
+    }
 
-    for op in s_l {
-        if let HistoryOp::Query { alpha, .. } = op {
-            has_query_l = true;
-            for &i in alpha {
-                alpha_l_set.insert(i);
+    // Right recurse: apply left updates to witnesses, then recurse right
+    if right.has_query {
+        let mut gq_r = gq_live.to_vec();
+
+        if !left.beta.is_empty() && !alpha_all.is_empty() {
+            // Optional fallback: pairwise (correct but can be slower)
+            let use_pairwise = std::env::var_os("CAUCHY_HISTORY_PAIRWISE").is_some();
+            if use_pairwise {
+                for (ai, &aidx) in alpha_all.iter().enumerate() {
+                    let mut w = gq_r[ai];
+                    for (&bidx, &d) in left.beta.iter().zip(left.delta.iter()) {
+                        if !d.is_zero() {
+                            w = ctx.update_witness(aidx, w, bidx, d);
+                        }
+                    }
+                    gq_r[ai] = w;
+                }
+            } else {
+                gq_r = ctx.update_witnesses_batch(alpha_all, &gq_r, &left.beta, &left.delta);
             }
         }
-    }
-    for op in s_r {
-        if let HistoryOp::Query { alpha, .. } = op {
-            has_query_r = true;
-            for &i in alpha {
-                alpha_r_set.insert(i);
-            }
-        }
-    }
 
-    // If neither half has any queries, we're done.
-    if !has_query_l && !has_query_r {
-        return;
-    }
-
-    // Map from index -> position in current alpha_live, reused for both halves.
-    let mut live_pos: BTreeMap<usize, usize> = BTreeMap::new();
-    for (p, &idx) in alpha_live.iter().enumerate() {
-        live_pos.insert(idx, p);
-    }
-
-    // Gather left-half updates (β_l, Δ_l) and canonicalize.
-    let mut beta_l = Vec::<usize>::new();
-    let mut delta_l = Vec::<Fr>::new();
-    for op in s_l {
-        if let HistoryOp::Update { beta, delta } = op {
-            beta_l.extend_from_slice(beta);
-            delta_l.extend_from_slice(delta);
-        }
-    }
-    let (beta_l, delta_l) = canonicalize_beta_delta(&beta_l, &delta_l);
-
-    // Left side: recurse with α_l and its witnesses (projection of alpha_live/gq_live).
-    if has_query_l && !alpha_l_set.is_empty() {
-        let alpha_l: Vec<usize> = alpha_l_set.iter().copied().collect();
-        let mut gq_l = Vec::<G1>::with_capacity(alpha_l.len());
-        for &idx in &alpha_l {
-            let p = live_pos
-                .get(&idx)
-                .expect("alpha_l index not in alpha_live (invariant broken)");
-            gq_l.push(gq_live[*p]);
-        }
-        vupdate_inner(ctx, &alpha_l, &gq_l, s_l, out);
-    }
-
-    // Right side: recurse with α_r, after applying all S_l updates to its proofs.
-    if has_query_r && !alpha_r_set.is_empty() {
-        let alpha_r: Vec<usize> = alpha_r_set.iter().copied().collect();
-        let mut gq_r = Vec::<G1>::with_capacity(alpha_r.len());
-        for &idx in &alpha_r {
-            let p = live_pos
-                .get(&idx)
-                .expect("alpha_r index not in alpha_live (invariant broken)");
-            gq_r.push(gq_live[*p]);
-        }
-
-        if !beta_l.is_empty() {
-            // Batch update proofs for α_r with the accumulated left-half updates.
-            gq_r = ctx.update_witnesses_batch(&alpha_r, &gq_r, &beta_l, &delta_l);
-        }
-
-        vupdate_inner(ctx, &alpha_r, &gq_r, s_r, out);
+        vupdate_run(ctx, stream, right, alpha_all, &gq_r, out);
     }
 }
 
-/// Public entry point: VUpdate(S, α⃗) in the general form.
-///
-/// - `ctx` is your VcContext.
-/// - `alpha_all` are the indices for which you have final witnesses at the
-///   time corresponding to the *start* of `stream_reversed` (i.e., the
-///   final state in forward time).
-/// - `gq_alpha_all_final` are those witnesses, same order as `alpha_all`.
-/// - `stream_reversed` is the *reversed+negated* stream S as in §2.5.
-///
-/// For each QUERY in `stream_reversed` with a requested α_j, this returns:
-///   HistoryQueryResult { query_id, indices = α_j, proofs = witnesses at that point }.
-///
-/// Invariant required from the caller:
-///   For every QUERY{alpha = α_j}, we must have α_j ⊆ α_all.
-pub fn vupdate_history(
+pub fn vupdate_history_same_alpha(
     ctx: &VcContext,
     alpha_all: &[usize],
-    gq_alpha_all_final: &[G1],
+    gq_alpha_final: &[G1],
     stream_reversed: &[HistoryOp],
 ) -> Vec<HistoryQueryResult> {
-    // Collect the union of all α_j across the whole stream.
-    let mut alpha_union_set: BTreeSet<usize> = BTreeSet::new();
-    let mut any_query = false;
-    for op in stream_reversed {
-        if let HistoryOp::Query { alpha, .. } = op {
-            any_query = true;
-            for &i in alpha {
-                alpha_union_set.insert(i);
-            }
-        }
-    }
-
-    if !any_query {
+    if stream_reversed.is_empty() {
         return Vec::new();
     }
-    if alpha_union_set.is_empty() {
-        // There are queries, but all α_j are empty; they all yield empty proofs.
-        // We can handle this as a special case without recursing.
-        let mut out = Vec::new();
-        for op in stream_reversed {
-            if let HistoryOp::Query { query_id, alpha } = op {
-                debug_assert!(alpha.is_empty());
-                out.push(HistoryQueryResult {
-                    query_id: *query_id,
-                    indices: Vec::new(),
-                    proofs: Vec::new(),
-                });
-            }
-        }
-        return out;
+    debug_assert_eq!(alpha_all.len(), gq_alpha_final.len());
+
+    let root = build_node(stream_reversed, 0, stream_reversed.len());
+    if !root.has_query {
+        return Vec::new();
     }
 
-    // alpha_union is the "α⃗" for the full stream: union of all per-query α_j.
-    let alpha_union: Vec<usize> = alpha_union_set.iter().copied().collect();
-
-    // Map alpha_all -> positions, then restrict to alpha_union to build the initial gq_live.
-    let mut pos_all: BTreeMap<usize, usize> = BTreeMap::new();
-    for (p, &idx) in alpha_all.iter().enumerate() {
-        pos_all.insert(idx, p);
-    }
-
-    let mut gq_union = Vec::<G1>::with_capacity(alpha_union.len());
-    for &idx in &alpha_union {
-        let p = pos_all
-            .get(&idx)
-            .expect("alpha_union index not in alpha_all (caller invariant broken)");
-        gq_union.push(gq_alpha_all_final[*p]);
-    }
-
-    let mut outputs = Vec::new();
-    vupdate_inner(ctx, &alpha_union, &gq_union, stream_reversed, &mut outputs);
-    outputs
+    let mut out = Vec::new();
+    vupdate_run(
+        ctx,
+        stream_reversed,
+        &root,
+        alpha_all,
+        gq_alpha_final,
+        &mut out,
+    );
+    out
 }
