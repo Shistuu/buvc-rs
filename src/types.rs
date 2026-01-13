@@ -20,9 +20,11 @@ pub struct SnapshotOut {
     pub logn: usize,
     pub srs_id: String,
     pub gc_hex: String,
-
+    pub values_hex: Vec<String>,
+    pub witnesses_hex: Vec<String>,
+    
     pub universe_mode: String,
-    pub balance_encoding: String, // e.g. "fr_exact_from_u256"
+    pub balance_encoding: String,
 }
 
 /// Publisher update record per block: (β, Δ) and pinned commitment C_t.

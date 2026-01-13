@@ -2,7 +2,7 @@
 use ark_bls12_381::{fr::Fr, G1Projective as G1};
 use ark_ff::{Field, Zero};
 use clap::{Parser, Subcommand};
-use ethers_core::types::{Address, U256};
+use ethers_core::types::{Address};
 use eyre::{bail, Result};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -21,8 +21,7 @@ use buvc_rs::indexer::Indexer;
 use buvc_rs::journal::append_line;
 use buvc_rs::snapshot_vals;
 use buvc_rs::srs::{load_or_create_srs, make_ctx};
-use buvc_rs::types::{JournalLine, SnapshotOut, SnapshotState, UserState};
-use buvc_rs::vc_context::VcContext;
+use buvc_rs::types::{JournalLine, SnapshotOut, UserState};
 use buvc_rs::proof_server::ProofServerState;
 
 /* ------------------------------------------------------------- */
@@ -404,8 +403,9 @@ fn cmd_publisher_snapshot(
     snapshot_vals: PathBuf,
     out: PathBuf,
 ) -> Result<()> {
-    let n = 1usize << logn;
+    let t0 = t_start();
 
+    let n = 1usize << logn;
     let (vp, srs_id) = load_or_create_srs(&srs, logn)?;
     let ctx = make_ctx(&vp, logn);
 
@@ -423,7 +423,8 @@ fn cmd_publisher_snapshot(
         v[i] = fr_from_u256_exact(bal)?;
     }
 
-    let (gc, _) = ctx.build_commitment(&v);
+    let (gc, gq_full) = ctx.build_commitment(&v);
+
 
     let snap = SnapshotOut {
         block_number: block,
@@ -431,13 +432,30 @@ fn cmd_publisher_snapshot(
         logn,
         srs_id,
         gc_hex: g1_to_hex(&gc),
+        values_hex: v.iter().map(fr_to_hex).collect(),
+        witnesses_hex: gq_full.iter().map(g1_to_hex).collect(),
         universe_mode: "sequential".into(),
         balance_encoding: "fr_exact_from_u256".into(),
     };
+    
 
     fs::write(&out, serde_json::to_vec_pretty(&snap)?)?;
+
+    let micros = t_us(t0);
+    let sz = fs::metadata(&out)?.len() as usize;
+    // alpha=0, beta used as "bytes"
+    emit(
+        "[PublisherSnapshot]",
+        block,
+        n,
+        0,
+        sz,
+        micros,
+    );
+
     Ok(())
 }
+
 
 /* ------------------------------------------------------------- */
 /* Publisher advance                                              */
@@ -539,15 +557,16 @@ fn cmd_issue_user_state(
     srs: PathBuf,
     snapshot: PathBuf,
     universe_file: PathBuf,
-    snapshot_vals: PathBuf,
+    _snapshot_vals: PathBuf,
     alpha_addresses: Option<String>,
     alpha_file: Option<PathBuf>,
     out: PathBuf,
 ) -> Result<()> {
+    let t0 = t_start();
     let n = 1usize << logn;
 
     let (vp, srs_id) = load_or_create_srs(&srs, logn)?;
-    let ctx = make_ctx(&vp, logn);
+    let _ctx = make_ctx(&vp, logn);
 
     let snap: SnapshotOut = serde_json::from_slice(&fs::read(snapshot)?)?;
     let universe = read_addresses_file(&universe_file)?;
@@ -560,17 +579,17 @@ fn cmd_issue_user_state(
     };
 
     let (alpha_idx, alpha_hex) = build_alpha_strict(&alpha_addrs, &indexer)?;
+    let alpha_len = alpha_idx.len();
+    // Slice balances & witnesses from snapshot
+    let vals = alpha_idx
+    .iter()
+    .map(|&i| snap.values_hex[i].clone())
+    .collect();
 
-    let bals = snapshot_vals::read_u256hex_lines(&snapshot_vals)?;
-    let mut v = vec![Fr::ZERO; n];
-    for (a, bal) in universe.into_iter().zip(bals.into_iter()) {
-        let i = indexer.index_of(a)?;
-        v[i] = fr_from_u256_exact(bal)?;
-    }
-
-    let (_, wit) = ctx.build_commitment_for_alpha(&v, &alpha_idx);
-
-    let vals = alpha_idx.iter().map(|&i| fr_to_hex(&v[i])).collect();
+    let wit = alpha_idx
+    .iter()
+    .map(|&i| snap.witnesses_hex[i].clone())
+    .collect::<Vec<_>>();
 
     let user = UserState {
         n,
@@ -581,16 +600,27 @@ fn cmd_issue_user_state(
         alpha_indices: alpha_idx,
         alpha_addresses: alpha_hex,
         alpha_values_hex: vals,
-        alpha_witnesses_hex: wit.iter().map(g1_to_hex).collect(),
+        alpha_witnesses_hex: wit,
         universe_mode: snap.universe_mode,
-        value_mode: "server_tracked".into(),
-        witness_mode: "server_tracked".into(),
+        value_mode: "snapshot".to_string(),
+        witness_mode: "snapshot".to_string(),
     };
+    
+    
 
-    fs::write(out, serde_json::to_vec_pretty(&user)?)?;
+    fs::write(&out, serde_json::to_vec_pretty(&user)?)?;
+    let micros = t_us(t0);
+    let sz = fs::metadata(&out)?.len() as usize;
+    emit(
+        "[IssueUserState]",
+        snap.block_number,
+        n,
+        alpha_len, // use stored len
+        sz,
+        micros,
+    );
     Ok(())
-}
-
+}    
 /* ------------------------------------------------------------- */
 /* Proof-server init + advance                                    */
 /* ------------------------------------------------------------- */
@@ -602,6 +632,7 @@ fn cmd_proof_server_init(
     user_states: Vec<PathBuf>,
     out: PathBuf,
 ) -> Result<()> {
+    let t0 = t_start();
     // Ensure SRS exists and capture its id
     let (_vp, srs_id) = load_or_create_srs(&srs, logn)?;
     let snap: SnapshotOut = serde_json::from_slice(&fs::read(&snapshot)?)?;
@@ -617,8 +648,24 @@ fn cmd_proof_server_init(
     let mut users = Vec::new();
     for (i, p) in user_states.iter().enumerate() {
         let u: UserState = serde_json::from_slice(&fs::read(p)?)?;
+    
+        // 🛡️ Sanity assertions per user
+        assert_eq!(
+            u.alpha_indices.len(),
+            u.alpha_values_hex.len(),
+            "alpha length mismatch in values for user {}",
+            i + 1
+        );
+        assert_eq!(
+            u.alpha_indices.len(),
+            u.alpha_witnesses_hex.len(),
+            "alpha length mismatch in witnesses for user {}",
+            i + 1
+        );
+    
         users.push((format!("user{}", i + 1), u));
     }
+    
 
     let ps = ProofServerState::from_user_states(&users)?;
 
@@ -627,8 +674,19 @@ fn cmd_proof_server_init(
         bail!("snapshot.json inconsistent with user_state files");
     }
 
-    fs::write(out, serde_json::to_vec_pretty(&ps)?)?;
+    fs::write(&out, serde_json::to_vec_pretty(&ps)?)?;
+    let micros = t_us(t0);
+    let sz = fs::metadata(&out)?.len() as usize;
+    emit(
+        "[ProofServerInit]",
+        ps.last_block,
+        ps.n,
+        ps.alpha_indices.len(), // union α
+        sz,                     // bytes
+        micros,
+    );
     Ok(())
+    
 }
 
 fn cmd_proof_server_advance(
@@ -650,6 +708,9 @@ fn cmd_proof_server_advance(
     let srs_id = ps.srs_id.clone();
     let n = ps.n;
     let logn_ps = ps.logn;
+    let mut blocks_applied = 0usize;
+    let mut updates_applied = 0usize;
+    let t_total = t_start();
 
     buvc_rs::journal::for_each_line_filtered(
         &journal,
@@ -661,6 +722,7 @@ fn cmd_proof_server_advance(
                 return Ok(());
             }
 
+            let t_block = t_start();
             let mut delta = Vec::<Fr>::new();
             for h in &j.delta_hex {
                 delta.push(fr_from_hex(h)?);
@@ -676,11 +738,45 @@ fn cmd_proof_server_advance(
                 j.block_number,
                 j.gc_hex.as_deref(),
             )?;
+            blocks_applied += 1;
+            updates_applied += beta.len();
+
+            let micros = t_us(t_block);
+            emit(
+                "[ProofServerAdvanceBlock]",
+                j.block_number,
+                ps.n,
+                ps.alpha_indices.len(),
+                beta.len(),
+                micros,
+            );
+            
+            eprintln!(
+                "[ProofServerAdvance] block={} beta={} micros={}",
+                j.block_number,
+                beta.len(),
+                micros
+            );
             Ok(())
         },
     )?;
 
     fs::write(out, serde_json::to_vec_pretty(&ps)?)?;
+    let total_micros = t_us(t_total);
+    emit(
+        "[ProofServerAdvanceTotal]",
+        ps.last_block,
+        ps.n,
+        ps.alpha_indices.len(),
+        updates_applied,
+        total_micros,
+    );
+    eprintln!(
+        "[ProofServerAdvance] blocks_applied={} updates={} total_micros={}",
+        blocks_applied,
+        updates_applied,
+        total_micros
+    );
     Ok(())
 }
 
@@ -713,9 +809,11 @@ fn cmd_proof_server_history(
     user_id: String,
     out: PathBuf,
 ) -> Result<()> {
+    let t_total = t_start();
     // ---- Load proof-server state ----
     let ps: ProofServerState =
         serde_json::from_slice(&fs::read(&proof_server_state)?)?;
+        assert_eq!(ps.alpha_indices.len(), ps.alpha_witnesses_hex.len());
 
     if ps.logn != logn {
         bail!("logn mismatch");
@@ -761,7 +859,10 @@ fn cmd_proof_server_history(
     let mut ops_fwd = Vec::<HistoryOp>::new();
     let mut qid_to_block = Vec::<u64>::new();
     let mut qpos = 0usize;
+    let _blocks_scanned = 0usize;
+    let _updates_scanned = 0usize;
 
+    let t_journal = t_start();
     buvc_rs::journal::for_each_line_filtered(
         &journal,
         &ps.srs_id,
@@ -769,9 +870,11 @@ fn cmd_proof_server_history(
         ps.logn,
         |j: JournalLine| -> Result<()> {
             let b = j.block_number;
-            if b <= start_block || b > ps.last_block {
+            let max_q = *blocks.last().unwrap();
+            if j.block_number <= start_block || j.block_number > max_q {
                 return Ok(());
             }
+            
 
             // UPDATE
             let mut delta = Vec::<Fr>::new();
@@ -799,6 +902,20 @@ fn cmd_proof_server_history(
             Ok(())
         },
     )?;
+    let journal_micros = t_us(t_journal);
+    emit(
+        "[ProofServerHistoryJournal]",
+        0,
+        ps.n,
+        ps.alpha_indices.len(),
+        qid_to_block.len(),
+        journal_micros,
+    );
+    eprintln!(
+        "[ProofServerHistory] journal_scan queries={} micros={}",
+        qid_to_block.len(),
+        journal_micros
+    );
     let t0 = t_start();
     // ---- Reverse ops + negate deltas ----
     let mut ops_rev = ops_fwd;
@@ -843,6 +960,7 @@ fn cmd_proof_server_history(
 
     for r in hist {
         let block = qid_to_block[r.query_id];
+        let t_q = t_start();
         let all_vals = vals_map
             .get(&block)
             .ok_or_else(|| eyre::eyre!("missing values for block {}", block))?;
@@ -854,6 +972,15 @@ fn cmd_proof_server_history(
             user_vals.push(fr_to_hex(&all_vals[p]));
             user_wits.push(g1_to_hex(&r.proofs[p]));
         }
+        let dt_q = t_us(t_q);
+        emit(
+            "[ProofServerHistoryPerQuery]",
+            block,
+            ps.n,
+            user_pos.len(), // user α
+            0,
+            dt_q,
+        );
 
         out_all.push(ProofServerHistoryOut {
             user_id: user_id.clone(),
@@ -867,6 +994,7 @@ fn cmd_proof_server_history(
     
     out_all.sort_by_key(|o| o.block);
 
+
     let micros = t_us(t0);
     // Core history algorithm latency (does NOT include state/SRS load or journal scan)
     emit(
@@ -877,7 +1005,22 @@ fn cmd_proof_server_history(
         out_all.len(),             // beta field reused as "queries" = #blocks
         micros,
     );
+    eprintln!(
+        "[ProofServerHistory] core queries={} micros={}",
+        out_all.len(),
+        micros
+    );
+ let json = serde_json::to_vec_pretty(&out_all)?;
+    let payload_bytes = json.len() as usize;
 
+    emit(
+        "[ProofServerHistoryPayload]",
+        0,
+        ps.n,
+        ps.alpha_indices.len(), // union α
+        payload_bytes,          // β used as size
+        0,
+    );
     // ---- Write output ----
     fs::write(&out, serde_json::to_vec_pretty(&out_all)?)?;
     eprintln!(
@@ -885,6 +1028,20 @@ fn cmd_proof_server_history(
         user_id,
         out_all.len(),
         out.display()
+    );
+    let total_micros = t_us(t_total);
+    emit(
+        "[ProofServerHistoryTotal]",
+        0,
+        ps.n,
+        ps.alpha_indices.len(),
+        out_all.len(),
+        total_micros,
+    );
+    eprintln!(
+        "[ProofServerHistory] total queries={} micros={}",
+        out_all.len(),
+        total_micros
     );
     Ok(())
 }
@@ -907,6 +1064,11 @@ fn cmd_user_verify(
 
     // n = vector size (for metrics)
     let n = 1usize << logn;
+
+    // ---- totals for [UserVerifyTotal] ----
+    let mut total_alpha = 0usize;
+    let mut proofs = 0usize;
+    let t_total = t_start();
 
     for h in hist {
         let gc = g1_from_hex(&h.commitment_hex)?;
@@ -937,7 +1099,21 @@ fn cmd_user_verify(
             "user={} block={} verify_multi={} micros={}",
             h.user_id, h.block, ok, dt
         );
+
+        // accumulate totals
+        total_alpha += h.indices.len();
+        proofs += 1;
     }
+
+    let total_micros = t_us(t_total);
+    emit(
+        "[UserVerifyTotal]",
+        0,
+        n,
+        total_alpha, // total α checked across all proofs
+        proofs,      // β reused as "#proofs"
+        total_micros,
+    );
 
     Ok(())
 }

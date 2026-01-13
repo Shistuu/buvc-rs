@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 use serde::{Serialize, Deserialize};
 use eyre::{Result, bail};
@@ -18,6 +19,14 @@ use crate::journal::for_each_line_filtered;
 /* ============================================================
  * Helpers
  * ============================================================ */
+
+fn t_start() -> Instant {
+    Instant::now()
+}
+
+fn t_us(t0: Instant) -> u128 {
+    t0.elapsed().as_micros() as u128
+}
 
 pub fn canonicalize_beta_delta(
     beta: &[usize],
@@ -158,6 +167,7 @@ impl ProofServerState {
         block: u64,
         pinned_gc: Option<&str>,
     ) -> Result<()> {
+        let t0 = t_start();
         let mut gc = g1_from_hex(&self.gc_hex)?;
 
         // Update global commitment
@@ -208,6 +218,14 @@ impl ProofServerState {
 
         self.gc_hex = g1_to_hex(&gc);
         self.last_block = block;
+        let dt = t_us(t0);
+        eprintln!(
+            "[ProofServerState::apply_update] block={} beta={} alpha={} micros={}",
+            block,
+            beta.len(),
+            self.alpha_indices.len(),
+            dt
+        );
         Ok(())
     }
 
@@ -220,26 +238,26 @@ impl ProofServerState {
         user_id: &str,
     ) -> Option<(Vec<usize>, Vec<String>, Vec<String>)> {
         let user = self.users.iter().find(|u| u.user_id == user_id)?;
-
+    
         let mut pos = HashMap::new();
         for (i, &idx) in self.alpha_indices.iter().enumerate() {
             pos.insert(idx, i);
         }
-
+    
         let mut idxs = Vec::new();
         let mut wits = Vec::new();
         let mut vals = Vec::new();
-
+    
         for &i in &user.alpha_indices {
             let p = *pos.get(&i)?;
             idxs.push(i);
             wits.push(self.alpha_witnesses_hex[p].clone());
             vals.push(self.alpha_values_hex[p].clone());
         }
-
+    
         Some((idxs, vals, wits))
     }
-
+    
     /// Return (user_alpha_indices, positions in union-α vector)
     pub fn user_alpha(
         &self,
@@ -272,6 +290,7 @@ impl ProofServerState {
         start_block: u64,
         mut blocks: Vec<u64>,
     ) -> Result<Vec<(u64, Vec<G1>)>> {
+        let t_total = t_start();
         blocks.sort_unstable();
         blocks.dedup();
 
@@ -291,6 +310,7 @@ impl ProofServerState {
         let mut qid_to_block = Vec::<u64>::new();
         let mut qpos = 0usize;
 
+        let t_journal = t_start();
         for_each_line_filtered(
             journal,
             &self.srs_id,
@@ -327,6 +347,13 @@ impl ProofServerState {
                 Ok(())
             },
         )?;
+        let dt_journal = t_us(t_journal);
+        eprintln!(
+            "[ProofServerState::history_query_same_alpha] journal blocks={} queries={} micros={}",
+            blocks.len(),
+            qid_to_block.len(),
+            dt_journal
+        );
 
         let mut ops_rev = ops_fwd;
         ops_rev.reverse();
@@ -338,11 +365,18 @@ impl ProofServerState {
             }
         }
 
+        let t_core = t_start();
         let results = vupdate_history_same_alpha(
             ctx,
             &self.alpha_indices,
             &gq_final,
             &ops_rev,
+        );
+        let dt_core = t_us(t_core);
+        eprintln!(
+            "[ProofServerState::history_query_same_alpha] rewind queries={} micros={}",
+            qid_to_block.len(),
+            dt_core
         );
 
         let mut out = Vec::new();
@@ -351,6 +385,12 @@ impl ProofServerState {
         }
 
         out.sort_by_key(|(b, _)| *b);
+        let dt_total = t_us(t_total);
+        eprintln!(
+            "[ProofServerState::history_query_same_alpha] total queries={} micros={}",
+            qid_to_block.len(),
+            dt_total
+        );
         Ok(out)
     }
 }

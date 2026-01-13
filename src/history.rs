@@ -206,21 +206,7 @@ fn vupdate_run(
         let mut gq_r = gq_live.to_vec();
 
         if !left.beta.is_empty() && !alpha_all.is_empty() {
-            // Optional fallback: pairwise (correct but can be slower)
-            let use_pairwise = std::env::var_os("CAUCHY_HISTORY_PAIRWISE").is_some();
-            if use_pairwise {
-                for (ai, &aidx) in alpha_all.iter().enumerate() {
-                    let mut w = gq_r[ai];
-                    for (&bidx, &d) in left.beta.iter().zip(left.delta.iter()) {
-                        if !d.is_zero() {
-                            w = ctx.update_witness(aidx, w, bidx, d);
-                        }
-                    }
-                    gq_r[ai] = w;
-                }
-            } else {
-                gq_r = ctx.update_witnesses_batch(alpha_all, &gq_r, &left.beta, &left.delta);
-            }
+            gq_r = ctx.update_witnesses_batch(alpha_all, &gq_r, &left.beta, &left.delta);
         }
 
         vupdate_run(ctx, stream, right, alpha_all, &gq_r, out);
