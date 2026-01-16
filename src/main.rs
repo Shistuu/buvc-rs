@@ -2,24 +2,24 @@
 use ark_bls12_381::{fr::Fr, G1Projective as G1};
 use ark_ff::{Field, Zero};
 use clap::{Parser, Subcommand};
-use ethers_core::types::{Address};
+use ethers_core::types::Address;
 use eyre::{bail, Result};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::BufRead;
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Instant;
 
 use buvc_rs::codec::{
-    delta_fr, fr_from_hex, fr_from_u256_exact, fr_to_hex, g1_from_hex, g1_to_hex, parse_addr_list,
+    delta_fr, fr_from_hex, fr_from_u256_exact, fr_to_hex, g1_from_hex, g1_to_hex
 };
+use buvc_rs::snapshot_vals;
 use buvc_rs::dataset_helpers::StateTracker;
 use buvc_rs::history::{vupdate_history_same_alpha, HistoryOp};
 use buvc_rs::indexer::Indexer;
 use buvc_rs::journal::append_line;
-use buvc_rs::snapshot_vals;
 use buvc_rs::srs::{load_or_create_srs, make_ctx};
 use buvc_rs::types::{JournalLine, SnapshotOut, UserState};
 use buvc_rs::proof_server::ProofServerState;
@@ -45,14 +45,16 @@ struct Metric {
     micros: u128,
 }
 
-fn emit(
-    phase: &'static str,
-    block: u64,
-    n: usize,
-    alpha: usize,
-    beta: usize,
-    micros: u128,
-) {
+#[derive(Clone, Debug, serde::Deserialize)]
+struct JournalLineLite {
+    pub block_number: u64,
+    pub n: usize,
+    pub logn: usize,
+    pub srs_id: String,
+    pub changed_indices: Vec<usize>,
+    pub delta_hex: Vec<String>,
+
+fn emit(phase: &'static str, block: u64, n: usize, alpha: usize, beta: usize, micros: u128) {
     let m = Metric { phase, block, n, alpha, beta, micros };
     println!("METRIC {}", serde_json::to_string(&m).unwrap());
 }
@@ -88,33 +90,6 @@ fn read_addresses_file(path: &Path) -> eyre::Result<Vec<Address>> {
     }
     Ok(out)
 }
-
-fn build_alpha_strict(
-    alpha_addrs: &[Address],
-    indexer: &Indexer,
-) -> Result<(Vec<usize>, Vec<String>)> {
-    if alpha_addrs.is_empty() {
-        bail!("|α| must be > 0");
-    }
-
-    let mut tmp: Vec<(usize, Address)> = Vec::new();
-    for &a in alpha_addrs {
-        tmp.push((indexer.index_of(a)?, a));
-    }
-
-    tmp.sort_by_key(|(i, _)| *i);
-    for w in tmp.windows(2) {
-        if w[0].0 == w[1].0 {
-            bail!("duplicate α index {}", w[0].0);
-        }
-    }
-
-    let indices = tmp.iter().map(|(i, _)| *i).collect();
-    let hex = tmp.iter().map(|(_, a)| format!("{:#x}", a)).collect();
-
-    Ok((indices, hex))
-}
-
 /* ------------------------------------------------------------- */
 /* CLI                                                           */
 /* ------------------------------------------------------------- */
@@ -173,7 +148,7 @@ enum Cmd {
         journal: PathBuf,
     },
 
-    IssueUserState {
+       ProofServerInit {
         #[arg(long)]
         logn: usize,
         #[arg(long)]
@@ -181,30 +156,14 @@ enum Cmd {
         #[arg(long)]
         snapshot: PathBuf,
         #[arg(long)]
-        universe_file: PathBuf,
+        user_id: Vec<String>,
         #[arg(long)]
-        snapshot_vals: PathBuf,
-        #[arg(long)]
-        alpha_addresses: Option<String>,
-        #[arg(long)]
-        alpha_file: Option<PathBuf>,
+        user_state: Vec<PathBuf>,
+    
         #[arg(long)]
         out: PathBuf,
     },
-
-    ProofServerInit {
-        #[arg(long)]
-        logn: usize,
-        #[arg(long)]
-        srs: PathBuf,
-        #[arg(long)]
-        snapshot: PathBuf,
-        #[arg(long)]
-        user_states: Vec<PathBuf>,
-        #[arg(long)]
-        out: PathBuf,
-    },
-
+    
     ProofServerAdvance {
         #[arg(long)]
         logn: usize,
@@ -216,6 +175,19 @@ enum Cmd {
         journal: PathBuf,
         #[arg(long)]
         end_block: u64,
+        #[arg(long)]
+        out: PathBuf,
+    },
+
+    ProofServerExportUserState {
+        #[arg(long)]
+        logn: usize,
+        #[arg(long)]
+        srs: PathBuf,
+        #[arg(long)]
+        proof_server_state: PathBuf,
+        #[arg(long)]
+        user_id: String,
         #[arg(long)]
         out: PathBuf,
     },
@@ -245,130 +217,56 @@ enum Cmd {
         #[arg(long)]
         srs: PathBuf,
         #[arg(long)]
+        journal: PathBuf,
+        #[arg(long)]
+        user_state: PathBuf,
+        #[arg(long)]
         history: PathBuf,
+        #[arg(long)]
+        claims: Option<PathBuf>,
     },
 }
 
 fn main() -> Result<()> {
     color_eyre::install().ok();
     let cli = Cli::parse();
+
     match cli.cmd {
-        Cmd::BuildUniverse {
-            dataset_dir,
-            start_block,
-            end_block,
-            out,
-        } => cmd_build_universe(
-            dataset_dir,
-            start_block,
-            end_block,
-            out,
-        ),
-
-        Cmd::PublisherSnapshot {
-            logn,
-            srs,
-            block,
-            universe_file,
-            snapshot_vals,
-            out,
-        } => cmd_publisher_snapshot(logn, srs, block, universe_file, snapshot_vals, out),
-
-        Cmd::PublisherAdvance {
-            logn,
-            srs,
-            dataset_dir,
-            universe_file,
-            snapshot,
-            snapshot_vals,
-            end_block,
-            journal,
-        } => cmd_publisher_advance(
-            logn,
-            srs,
-            dataset_dir,
-            universe_file,
-            snapshot,
-            snapshot_vals,
-            end_block,
-            journal,
-        ),
-
-        Cmd::IssueUserState {
-            logn,
-            srs,
-            snapshot,
-            universe_file,
-            snapshot_vals,
-            alpha_addresses,
-            alpha_file,
-            out,
-        } => cmd_issue_user_state(
-            logn,
-            srs,
-            snapshot,
-            universe_file,
-            snapshot_vals,
-            alpha_addresses,
-            alpha_file,
-            out,
-        ),
-
-        Cmd::ProofServerInit {
-            logn,
-            srs,
-            snapshot,
-            user_states,
-            out,
-        } => cmd_proof_server_init(logn, srs, snapshot, user_states, out),
-
-        Cmd::ProofServerAdvance {
-            logn,
-            srs,
-            proof_server_state,
-            journal,
-            end_block,
-            out,
-        } => cmd_proof_server_advance(logn, srs, proof_server_state, journal, end_block, out),
-
-        Cmd::ProofServerHistory {
-                logn,
-                srs,
-                proof_server_state,
-                journal,
-                start_block,
-                blocks,
-                user_id,
-                out,
-            } => cmd_proof_server_history(
-                logn,
-                srs,
-                proof_server_state,
-                journal,
-                start_block,
-                blocks,
-                user_id,
-                out,
-            ),
-
-        Cmd::UserVerify {
-            logn,
-            srs,
-            history,
-        } => cmd_user_verify(logn, srs, history),
-    }
+        Cmd::BuildUniverse { dataset_dir, start_block, end_block, out } => {
+            cmd_build_universe(dataset_dir, start_block, end_block, out)
+        }
+    
+        Cmd::PublisherSnapshot { logn, srs, block, universe_file, snapshot_vals, out } => {
+            cmd_publisher_snapshot(logn, srs, block, universe_file, snapshot_vals, out)
+        }
+    
+        Cmd::PublisherAdvance { logn, srs, dataset_dir, universe_file, snapshot, snapshot_vals, end_block, journal } => {
+            cmd_publisher_advance(logn, srs, dataset_dir, universe_file, snapshot, snapshot_vals, end_block, journal)
+        }
+    
+        Cmd::ProofServerInit { logn, srs, snapshot, user_id, user_state, out } => {
+            cmd_proof_server_init(logn, srs, snapshot, user_id, user_state, out)
+        }
+    
+        Cmd::ProofServerAdvance { logn, srs, proof_server_state, journal, end_block, out } => {
+            cmd_proof_server_advance(logn, srs, proof_server_state, journal, end_block, out)
+        }
+    
+        Cmd::ProofServerExportUserState { logn, srs, proof_server_state, user_id, out } => {
+            cmd_proof_server_export_user_state(logn, srs, proof_server_state, user_id, out)
+        }
+    
+        Cmd::ProofServerHistory { logn, srs, proof_server_state, journal, start_block, blocks, user_id, out } => {
+            cmd_proof_server_history(logn, srs, proof_server_state, journal, start_block, blocks, user_id, out)
+        }
+    
+        Cmd::UserVerify { logn, srs, journal, user_state, history, claims } => {
+            cmd_user_verify(logn, srs, journal, user_state, history, claims)
+        }
+    }    
 }
 
-/* ------------------------------------------------------------- */
-/* Build universe                                                 */
-/* ------------------------------------------------------------- */
-
-fn cmd_build_universe(
-    dataset_dir: PathBuf,
-    start_block: u64,
-    end_block: u64,
-    out: PathBuf,
-) -> Result<()> {
+fn cmd_build_universe(dataset_dir: PathBuf, start_block: u64, end_block: u64, out: PathBuf) -> Result<()> {
     let mut dataset = buvc_rs::dataset::DatasetReader::new(&dataset_dir, 100_000);
     let mut addrs = HashSet::<Address>::new();
 
@@ -382,25 +280,17 @@ fn cmd_build_universe(
     let mut v: Vec<_> = addrs.into_iter().collect();
     v.sort();
 
-    fs::write(
-        &out,
-        v.iter().map(|a| format!("{:#x}\n", a)).collect::<String>(),
-    )?;
-
+    fs::write(&out, v.iter().map(|a| format!("{:#x}\n", a)).collect::<String>())?;
     eprintln!("Universe built: {} addresses", v.len());
     Ok(())
 }
-
-/* ------------------------------------------------------------- */
-/* Publisher snapshot                                             */
-/* ------------------------------------------------------------- */
 
 fn cmd_publisher_snapshot(
     logn: usize,
     srs: PathBuf,
     block: u64,
     universe_file: PathBuf,
-    snapshot_vals: PathBuf,
+    snapshot_vals_path: PathBuf,
     out: PathBuf,
 ) -> Result<()> {
     let t0 = t_start();
@@ -410,7 +300,7 @@ fn cmd_publisher_snapshot(
     let ctx = make_ctx(&vp, logn);
 
     let universe = read_addresses_file(&universe_file)?;
-    let bals = snapshot_vals::read_u256hex_lines(&snapshot_vals)?;
+    let bals = snapshot_vals::read_u256hex_lines(&snapshot_vals_path)?;
     if universe.len() != bals.len() {
         bail!("snapshot_vals length mismatch");
     }
@@ -423,8 +313,7 @@ fn cmd_publisher_snapshot(
         v[i] = fr_from_u256_exact(bal)?;
     }
 
-    let (gc, gq_full) = ctx.build_commitment(&v);
-
+    let (gc, _gq_full) = ctx.build_commitment(&v);
 
     let snap = SnapshotOut {
         block_number: block,
@@ -432,34 +321,17 @@ fn cmd_publisher_snapshot(
         logn,
         srs_id,
         gc_hex: g1_to_hex(&gc),
-        values_hex: v.iter().map(fr_to_hex).collect(),
-        witnesses_hex: gq_full.iter().map(g1_to_hex).collect(),
         universe_mode: "sequential".into(),
         balance_encoding: "fr_exact_from_u256".into(),
     };
-    
 
     fs::write(&out, serde_json::to_vec_pretty(&snap)?)?;
 
     let micros = t_us(t0);
     let sz = fs::metadata(&out)?.len() as usize;
-    // alpha=0, beta used as "bytes"
-    emit(
-        "[PublisherSnapshot]",
-        block,
-        n,
-        0,
-        sz,
-        micros,
-    );
-
+    emit("[PublisherSnapshot]", block, n, 0, sz, micros);
     Ok(())
 }
-
-
-/* ------------------------------------------------------------- */
-/* Publisher advance                                              */
-/* ------------------------------------------------------------- */
 
 fn cmd_publisher_advance(
     logn: usize,
@@ -467,7 +339,7 @@ fn cmd_publisher_advance(
     dataset_dir: PathBuf,
     universe_file: PathBuf,
     snapshot: PathBuf,
-    snapshot_vals: PathBuf,
+    snapshot_vals_path: PathBuf,
     end_block: u64,
     journal: PathBuf,
 ) -> Result<()> {
@@ -485,7 +357,7 @@ fn cmd_publisher_advance(
         100_000,
         snap.block_number,
         &universe,
-        &snapshot_vals,
+        &snapshot_vals_path,
     )?;
 
     let mut gc = g1_from_hex(&snap.gc_hex)?;
@@ -523,170 +395,54 @@ fn cmd_publisher_advance(
                 srs_id: srs_id.clone(),
                 changed_indices: beta,
                 delta_hex: delta.iter().map(fr_to_hex).collect(),
-                gc_hex: Some(g1_to_hex(&gc)),
+                gc_hex: Some(g1_to_hex(&gc)), // publisher pinned commitment
             },
         )?;
 
-        emit(
-            "[PublisherAdvance] block",
-            cur,
-            n,
-            0,
-            delta.len(),
-            t_us(t0),
-        );
-        emit(
-            "[CommitUpdate] block",
-            cur,
-            n,
-            0,
-            delta.len(),
-            t2,
-        );
+        emit("[PublisherAdvance] block", cur, n, 0, delta.len(), t_us(t0));
+        emit("[CommitUpdate] block", cur, n, 0, delta.len(), t2);
     }
 
     Ok(())
 }
 
-/* ------------------------------------------------------------- */
-/* Issue user state                                               */
-/* ------------------------------------------------------------- */
-
-fn cmd_issue_user_state(
-    logn: usize,
-    srs: PathBuf,
-    snapshot: PathBuf,
-    universe_file: PathBuf,
-    _snapshot_vals: PathBuf,
-    alpha_addresses: Option<String>,
-    alpha_file: Option<PathBuf>,
-    out: PathBuf,
-) -> Result<()> {
-    let t0 = t_start();
-    let n = 1usize << logn;
-
-    let (vp, srs_id) = load_or_create_srs(&srs, logn)?;
-    let _ctx = make_ctx(&vp, logn);
-
-    let snap: SnapshotOut = serde_json::from_slice(&fs::read(snapshot)?)?;
-    let universe = read_addresses_file(&universe_file)?;
-    let indexer = Indexer::from_universe_sequential(&universe, n)?;
-
-    let alpha_addrs = if let Some(f) = alpha_file {
-        read_addresses_file(&f)?
-    } else {
-        parse_addr_list(&alpha_addresses.unwrap())?
-    };
-
-    let (alpha_idx, alpha_hex) = build_alpha_strict(&alpha_addrs, &indexer)?;
-    let alpha_len = alpha_idx.len();
-    // Slice balances & witnesses from snapshot
-    let vals = alpha_idx
-    .iter()
-    .map(|&i| snap.values_hex[i].clone())
-    .collect();
-
-    let wit = alpha_idx
-    .iter()
-    .map(|&i| snap.witnesses_hex[i].clone())
-    .collect::<Vec<_>>();
-
-    let user = UserState {
-        n,
-        logn,
-        srs_id,
-        last_block: snap.block_number,
-        gc_hex: snap.gc_hex,
-        alpha_indices: alpha_idx,
-        alpha_addresses: alpha_hex,
-        alpha_values_hex: vals,
-        alpha_witnesses_hex: wit,
-        universe_mode: snap.universe_mode,
-        value_mode: "snapshot".to_string(),
-        witness_mode: "snapshot".to_string(),
-    };
-    
-    
-
-    fs::write(&out, serde_json::to_vec_pretty(&user)?)?;
-    let micros = t_us(t0);
-    let sz = fs::metadata(&out)?.len() as usize;
-    emit(
-        "[IssueUserState]",
-        snap.block_number,
-        n,
-        alpha_len, // use stored len
-        sz,
-        micros,
-    );
-    Ok(())
-}    
-/* ------------------------------------------------------------- */
-/* Proof-server init + advance                                    */
-/* ------------------------------------------------------------- */
-
 fn cmd_proof_server_init(
     logn: usize,
     srs: PathBuf,
     snapshot: PathBuf,
-    user_states: Vec<PathBuf>,
+    user_id: Vec<String>,
+    user_state: Vec<PathBuf>,
     out: PathBuf,
 ) -> Result<()> {
-    let t0 = t_start();
-    // Ensure SRS exists and capture its id
+    if user_id.len() != user_state.len() {
+        bail!("--user-id and --user-state length mismatch");
+    }
+
     let (_vp, srs_id) = load_or_create_srs(&srs, logn)?;
     let snap: SnapshotOut = serde_json::from_slice(&fs::read(&snapshot)?)?;
 
-    if snap.srs_id != srs_id {
-        bail!(
-            "SRS id mismatch between snapshot ({}) and srs.bin ({})",
-            snap.srs_id,
-            srs_id
-        );
+    if snap.srs_id != srs_id || snap.logn != logn {
+        bail!("snapshot / srs mismatch");
     }
 
     let mut users = Vec::new();
-    for (i, p) in user_states.iter().enumerate() {
-        let u: UserState = serde_json::from_slice(&fs::read(p)?)?;
-    
-        // 🛡️ Sanity assertions per user
-        assert_eq!(
-            u.alpha_indices.len(),
-            u.alpha_values_hex.len(),
-            "alpha length mismatch in values for user {}",
-            i + 1
-        );
-        assert_eq!(
-            u.alpha_indices.len(),
-            u.alpha_witnesses_hex.len(),
-            "alpha length mismatch in witnesses for user {}",
-            i + 1
-        );
-    
-        users.push((format!("user{}", i + 1), u));
+    for (uid, path) in user_id.into_iter().zip(user_state.into_iter()) {
+        let u: UserState = serde_json::from_slice(&fs::read(path)?)?;
+
+        if u.alpha_indices.len() != u.alpha_witnesses_hex.len() {
+            bail!("witness length mismatch for user {}", uid);
+        }
+
+        users.push((uid, u));
     }
-    
 
     let ps = ProofServerState::from_user_states(&users)?;
-
-    // sanity: align snapshot vs union user state
-    if ps.n != snap.n || ps.logn != snap.logn || ps.gc_hex != snap.gc_hex {
-        bail!("snapshot.json inconsistent with user_state files");
+    if ps.gc_hex != snap.gc_hex {
+        bail!("commitment mismatch with snapshot");
     }
 
     fs::write(&out, serde_json::to_vec_pretty(&ps)?)?;
-    let micros = t_us(t0);
-    let sz = fs::metadata(&out)?.len() as usize;
-    emit(
-        "[ProofServerInit]",
-        ps.last_block,
-        ps.n,
-        ps.alpha_indices.len(), // union α
-        sz,                     // bytes
-        micros,
-    );
     Ok(())
-    
 }
 
 fn cmd_proof_server_advance(
@@ -697,17 +453,23 @@ fn cmd_proof_server_advance(
     end_block: u64,
     out: PathBuf,
 ) -> Result<()> {
-    let mut ps: ProofServerState =
-        serde_json::from_slice(&fs::read(&proof_server_state)?)?;
+    let mut ps: ProofServerState = serde_json::from_slice(&fs::read(&proof_server_state)?)?;
 
     let (vp, _) = load_or_create_srs(&srs, logn)?;
     let ctx = make_ctx(&vp, logn);
 
-    // Take copies so we don't borrow `ps` immutably for the whole call.
+    let mut gc: G1 = g1_from_hex(&ps.gc_hex)?;
+    let mut gq: Vec<G1> = ps.alpha_witnesses_hex.iter().map(|h| g1_from_hex(h)).collect::<Result<Vec<_>>>()?;
+
+    if ps.alpha_indices.len() != gq.len() {
+        bail!("proof_server_state alpha_indices / alpha_witnesses mismatch");
+    }
+
     let start_block = ps.last_block;
     let srs_id = ps.srs_id.clone();
     let n = ps.n;
     let logn_ps = ps.logn;
+
     let mut blocks_applied = 0usize;
     let mut updates_applied = 0usize;
     let t_total = t_start();
@@ -721,83 +483,183 @@ fn cmd_proof_server_advance(
             if j.block_number <= start_block || j.block_number > end_block {
                 return Ok(());
             }
-
             let t_block = t_start();
-            let mut delta = Vec::<Fr>::new();
+
+            if j.changed_indices.len() != j.delta_hex.len() {
+                bail!("journal line malformed at block {}", j.block_number);
+            }
+
+            let mut delta = Vec::<Fr>::with_capacity(j.delta_hex.len());
             for h in &j.delta_hex {
                 delta.push(fr_from_hex(h)?);
             }
+            let (beta, delta) = canonicalize_beta_delta(&j.changed_indices, &delta);
 
-            let (beta, delta) =
-                canonicalize_beta_delta(&j.changed_indices, &delta);
+            let t_commit = t_start();
+            for (&i, &d) in beta.iter().zip(delta.iter()) {
+                gc = ctx.update_commitment(gc, i, d);
+            }
+            let commit_us = t_us(t_commit);
 
-            ps.apply_update(
-                &ctx,
-                &beta,
-                &delta,
-                j.block_number,
-                j.gc_hex.as_deref(),
-            )?;
+            if let Some(pinned) = j.gc_hex.as_deref() {
+                if g1_to_hex(&gc) != pinned {
+                    bail!("commitment mismatch at block {}", j.block_number);
+                }
+            } else {
+                bail!("journal line missing pinned gc_hex at block {}", j.block_number);
+            }
+
+            let t_wit = t_start();
+            if !beta.is_empty() && !ps.alpha_indices.is_empty() {
+                gq = ctx.update_witnesses_batch(&ps.alpha_indices, &gq, &beta, &delta);
+            }
+            let wit_us = t_us(t_wit);
+
+            ps.last_block = j.block_number;
+
             blocks_applied += 1;
             updates_applied += beta.len();
 
-            let micros = t_us(t_block);
-            emit(
-                "[ProofServerAdvanceBlock]",
-                j.block_number,
-                ps.n,
-                ps.alpha_indices.len(),
-                beta.len(),
-                micros,
-            );
-            
-            eprintln!(
-                "[ProofServerAdvance] block={} beta={} micros={}",
-                j.block_number,
-                beta.len(),
-                micros
-            );
+            emit("[ProofServerAdvanceBlock]", j.block_number, ps.n, ps.alpha_indices.len(), beta.len(), t_us(t_block));
+            emit("[ProofServerAdvanceCommitOnly]", j.block_number, ps.n, 0, beta.len(), commit_us);
+            emit("[ProofServerAdvanceWitnessOnly]", j.block_number, ps.n, ps.alpha_indices.len(), beta.len(), wit_us);
+
             Ok(())
         },
     )?;
 
+    ps.gc_hex = g1_to_hex(&gc);
+    ps.alpha_witnesses_hex = gq.iter().map(g1_to_hex).collect();
+
     fs::write(out, serde_json::to_vec_pretty(&ps)?)?;
+
     let total_micros = t_us(t_total);
-    emit(
-        "[ProofServerAdvanceTotal]",
-        ps.last_block,
-        ps.n,
-        ps.alpha_indices.len(),
-        updates_applied,
-        total_micros,
-    );
+    emit("[ProofServerAdvanceTotal]", ps.last_block, ps.n, ps.alpha_indices.len(), updates_applied, total_micros);
     eprintln!(
         "[ProofServerAdvance] blocks_applied={} updates={} total_micros={}",
-        blocks_applied,
-        updates_applied,
-        total_micros
+        blocks_applied, updates_applied, total_micros
     );
     Ok(())
 }
 
+fn cmd_proof_server_export_user_state(
+    logn: usize,
+    srs: PathBuf,
+    proof_server_state: PathBuf,
+    user_id: String,
+    out: PathBuf,
+) -> Result<()> {
+    let t0 = t_start();
 
-/* ------------------------------------------------------------- */
-/* History output structure                                       */
-/* ------------------------------------------------------------- */
+    let ps: ProofServerState = serde_json::from_slice(&fs::read(&proof_server_state)?)?;
+    if ps.logn != logn {
+        bail!("logn mismatch");
+    }
+    if ps.alpha_indices.len() != ps.alpha_witnesses_hex.len() {
+        bail!("alpha_indices / alpha_witnesses mismatch");
+    }
+
+    let (_vp, srs_id) = load_or_create_srs(&srs, logn)?;
+    if ps.srs_id != srs_id {
+        bail!("srs_id mismatch");
+    }
+
+    let (user_alpha, user_pos_in_union) = ps
+        .user_alpha(&user_id)
+        .ok_or_else(|| eyre::eyre!("unknown user_id"))?;
+
+    let mut gq_head: Vec<G1> = Vec::with_capacity(user_pos_in_union.len());
+    for &p in &user_pos_in_union {
+        gq_head.push(g1_from_hex(&ps.alpha_witnesses_hex[p])?);
+    }
+    let us = UserState {
+        n: ps.n,
+        logn: ps.logn,
+        srs_id: ps.srs_id.clone(),
+    
+        last_block: ps.last_block,
+
+        gc_hex: String::new(),
+    
+        alpha_indices: user_alpha.clone(),
+        alpha_addresses: Vec::new(),
+    
+        alpha_witnesses_hex: gq_head.iter().map(g1_to_hex).collect(),
+    
+        universe_mode: "external".to_string(),
+        witness_mode: "export_from_proof_server".to_string(),
+    };
+    
+    
+    fs::write(&out, serde_json::to_vec_pretty(&us)?)?;
+    let micros = t_us(t0);
+    let sz = fs::metadata(&out)?.len() as usize;
+    emit("[ProofServerExportUserState]", ps.last_block, ps.n, user_alpha.len(), sz, micros);
+    Ok(())
+}
+
+fn for_each_journal_line_rev_until<F>(path: &Path, mut f: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<bool>,
+{
+    const CHUNK_MIN: usize = 256 * 1024;       
+    const CHUNK_MAX: usize = 8 * 1024 * 1024;
+
+    let mut file = fs::File::open(path)?;
+    let mut pos = file.seek(SeekFrom::End(0))?;
+
+    let mut carry = String::new();
+    let mut chunk_size = CHUNK_MIN;
+    let mut iters: u64 = 0;
+
+    while pos > 0 {
+        iters += 1;
+
+        let rd = std::cmp::min(chunk_size as u64, pos) as usize;
+        pos -= rd as u64;
+        file.seek(SeekFrom::Start(pos))?;
+
+        let mut buf = vec![0u8; rd];
+        file.read_exact(&mut buf)?;
+
+        let mut chunk = String::from_utf8_lossy(&buf).to_string();
+        chunk.push_str(&carry);
+
+        let mut parts: Vec<&str> = chunk.split('\n').collect();
+        carry = parts.remove(0).to_string();
+
+        for line in parts.into_iter().rev() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if !f(line)? {
+                return Ok(());
+            }
+        }
+
+        if pos > (chunk_size as u64) * 4 && chunk_size < CHUNK_MAX {
+            chunk_size = std::cmp::min(chunk_size * 2, CHUNK_MAX);
+        } else if iters > 64 && chunk_size < CHUNK_MAX {
+            chunk_size = std::cmp::min(chunk_size * 2, CHUNK_MAX);
+        }
+    }
+
+    let line = carry.trim();
+    if !line.is_empty() {
+        let _ = f(line)?;
+    }
+
+    Ok(())
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct ProofServerHistoryOut {
     pub user_id: String,
     pub block: u64,
     pub indices: Vec<usize>,
-    pub values_hex: Vec<String>,
     pub witnesses_hex: Vec<String>,
-    pub commitment_hex: String,
 }
-
-/* ------------------------------------------------------------- */
-/* Proof-server history query                                     */
-/* ------------------------------------------------------------- */
 
 fn cmd_proof_server_history(
     logn: usize,
@@ -810,26 +672,24 @@ fn cmd_proof_server_history(
     out: PathBuf,
 ) -> Result<()> {
     let t_total = t_start();
-    // ---- Load proof-server state ----
-    let ps: ProofServerState =
-        serde_json::from_slice(&fs::read(&proof_server_state)?)?;
-        assert_eq!(ps.alpha_indices.len(), ps.alpha_witnesses_hex.len());
 
+    let ps: ProofServerState = serde_json::from_slice(&fs::read(&proof_server_state)?)?;
     if ps.logn != logn {
         bail!("logn mismatch");
     }
+    if ps.alpha_indices.len() != ps.alpha_witnesses_hex.len() {
+        bail!("alpha_indices / alpha_witnesses mismatch");
+    }
 
-    // ---- Load SRS + context ----
     let (vp, srs_id) = load_or_create_srs(&srs, logn)?;
     if ps.srs_id != srs_id {
         bail!("srs_id mismatch");
     }
     let ctx = make_ctx(&vp, logn);
 
-    // ---- Validate user ----
-    let (user_alpha, user_pos) = ps
+    let (user_alpha, user_pos_in_union) = ps
         .user_alpha(&user_id)
-        .ok_or_else(|| eyre::eyre!("unknown user_id {}", user_id))?;
+        .ok_or_else(|| eyre::eyre!("unknown user_id"))?;
 
     if blocks.is_empty() {
         bail!("--blocks must be non-empty");
@@ -844,276 +704,222 @@ fn cmd_proof_server_history(
         bail!("query block beyond server head");
     }
 
-    // ---- Final witnesses + values (at last_block) ----
-    let mut gq_final = Vec::<G1>::new();
-    for hx in &ps.alpha_witnesses_hex {
-        gq_final.push(g1_from_hex(hx)?);
+    let head_block = ps.last_block;
+    let min_block = blocks[0];
+    let want: HashSet<u64> = blocks.iter().copied().collect();
+
+    let t_decode = t_start();
+    let mut user_gq_head: Vec<G1> = Vec::with_capacity(user_pos_in_union.len());
+    for &p in &user_pos_in_union {
+        user_gq_head.push(g1_from_hex(&ps.alpha_witnesses_hex[p])?);
     }
+    emit("[HeadUserDecode]", head_block, ps.n, user_alpha.len(), user_alpha.len(), t_us(t_decode));
 
-    let mut vals_final = Vec::<Fr>::new();
-    for hx in &ps.alpha_values_hex {
-        vals_final.push(fr_from_hex(hx)?);
-    }
+    let t_build = t_start();
+    let mut stream_rev: Vec<HistoryOp> = Vec::new();
+    let mut cur = head_block;
 
-    // ---- Build forward history ops ----
-    let mut ops_fwd = Vec::<HistoryOp>::new();
-    let mut qid_to_block = Vec::<u64>::new();
-    let mut qpos = 0usize;
-    let _blocks_scanned = 0usize;
-    let _updates_scanned = 0usize;
+    let mut lines_parsed: usize = 0;
+    let mut micros_json_parse: u128 = 0;
+    let mut micros_delta_decode: u128 = 0;
 
-    let t_journal = t_start();
-    buvc_rs::journal::for_each_line_filtered(
-        &journal,
-        &ps.srs_id,
-        ps.n,
-        ps.logn,
-        |j: JournalLine| -> Result<()> {
-            let b = j.block_number;
-            let max_q = *blocks.last().unwrap();
-            if j.block_number <= start_block || j.block_number > max_q {
-                return Ok(());
-            }
-            
+    for_each_journal_line_rev_until(&journal, |line| -> Result<bool> {
+        let t_j = t_start();
+        let j: JournalLineLite = serde_json::from_str(line)?;
+        micros_json_parse += t_us(t_j);
+        lines_parsed += 1;
 
-            // UPDATE
-            let mut delta = Vec::<Fr>::new();
-            for hx in &j.delta_hex {
-                delta.push(fr_from_hex(hx)?);
-            }
-            let (beta, delta) =
-                canonicalize_beta_delta(&j.changed_indices, &delta);
-
-            if !beta.is_empty() {
-                ops_fwd.push(HistoryOp::Update { beta, delta });
-            }
-
-            // QUERY
-            while qpos < blocks.len() && blocks[qpos] < b {
-                qpos += 1;
-            }
-            if qpos < blocks.len() && blocks[qpos] == b {
-                let qid = qid_to_block.len();
-                ops_fwd.push(HistoryOp::Query { query_id: qid });
-                qid_to_block.push(b);
-                qpos += 1;
-            }
-
-            Ok(())
-        },
-    )?;
-    let journal_micros = t_us(t_journal);
-    emit(
-        "[ProofServerHistoryJournal]",
-        0,
-        ps.n,
-        ps.alpha_indices.len(),
-        qid_to_block.len(),
-        journal_micros,
-    );
-    eprintln!(
-        "[ProofServerHistory] journal_scan queries={} micros={}",
-        qid_to_block.len(),
-        journal_micros
-    );
-    let t0 = t_start();
-    // ---- Reverse ops + negate deltas ----
-    let mut ops_rev = ops_fwd;
-    ops_rev.reverse();
-    for op in ops_rev.iter_mut() {
-        if let HistoryOp::Update { delta, .. } = op {
-            for d in delta.iter_mut() {
-                *d = -*d;
-            }
+        if j.block_number <= start_block || j.block_number > head_block {
+            return Ok(true);
         }
-    }
-
-    // ---- Rewind witnesses (paper algorithm) ----
-    let hist = vupdate_history_same_alpha(
-        &ctx,
-        &ps.alpha_indices,
-        &gq_final,
-        &ops_rev,
-    );
-
-    // ---- Rewind values (linear replay; application-layer) ----
-    let mut vals_map: HashMap<u64, Vec<Fr>> = HashMap::new();
-    let mut cur_vals = vals_final.clone();
-
-    for op in ops_rev.iter() {
-        match op {
-            HistoryOp::Update { beta, delta } => {
-                for (&b, &d) in beta.iter().zip(delta.iter()) {
-                    if let Some(pos) = ps.alpha_indices.iter().position(|&i| i == b) {
-                        cur_vals[pos] += d;
-                    }
-                }
-            }
-            HistoryOp::Query { query_id } => {
-                vals_map.insert(qid_to_block[*query_id], cur_vals.clone());
-            }
+        if j.srs_id != ps.srs_id || j.logn != ps.logn || j.n != ps.n {
+            return Ok(true);
         }
+
+        while cur > j.block_number {
+            if want.contains(&cur) {
+                stream_rev.push(HistoryOp::Query { query_id: cur as usize });
+            }
+            if cur == min_block {
+                return Ok(false);
+            }
+            cur -= 1;
+        }
+
+        if want.contains(&cur) {
+            stream_rev.push(HistoryOp::Query { query_id: cur as usize });
+        }
+        if cur == min_block {
+            return Ok(false);
+        }
+
+        let t_d = t_start();
+        let mut delta = Vec::<Fr>::with_capacity(j.delta_hex.len());
+        for h in &j.delta_hex {
+            let mut d = fr_from_hex(h)?;
+            d = -d; // rewind
+            delta.push(d);
+        }
+        micros_delta_decode += t_us(t_d);
+
+        let (beta, delta) = canonicalize_beta_delta(&j.changed_indices, &delta);
+        if !beta.is_empty() {
+            stream_rev.push(HistoryOp::Update { beta, delta });
+        }
+
+        cur -= 1;
+        Ok(cur >= min_block)
+    })?;
+
+    while cur >= min_block {
+        if want.contains(&cur) {
+            stream_rev.push(HistoryOp::Query { query_id: cur as usize });
+        }
+        if cur == min_block {
+            break;
+        }
+        cur -= 1;
     }
 
-    // ---- Assemble output ----
+    emit("[HistoryJournalJsonParseLite]", 0, ps.n, user_alpha.len(), lines_parsed, micros_json_parse);
+    emit("[HistoryDeltaDecode]", 0, ps.n, user_alpha.len(), stream_rev.len(), micros_delta_decode);
+    emit("[HistoryBuildStream]", 0, ps.n, user_alpha.len(), stream_rev.len(), t_us(t_build));
+
+    let t_vu = t_start();
+    let vu = vupdate_history_same_alpha(&ctx, &user_alpha, &user_gq_head, &stream_rev);
+    emit("[HistoryVUpdateUserAlpha]", 0, ps.n, user_alpha.len(), vu.len(), t_us(t_vu));
+
+    let mut by_block: HashMap<u64, Vec<G1>> = HashMap::new();
+    for r in vu {
+        by_block.insert(r.query_id as u64, r.proofs);
+    }
+
+    let t_payload = t_start();
     let mut out_all = Vec::<ProofServerHistoryOut>::new();
-
-    for r in hist {
-        let block = qid_to_block[r.query_id];
-        let t_q = t_start();
-        let all_vals = vals_map
-            .get(&block)
-            .ok_or_else(|| eyre::eyre!("missing values for block {}", block))?;
-
-        let mut user_vals = Vec::new();
-        let mut user_wits = Vec::new();
-
-        for &p in &user_pos {
-            user_vals.push(fr_to_hex(&all_vals[p]));
-            user_wits.push(g1_to_hex(&r.proofs[p]));
+    for &b in &blocks {
+        let wits = by_block.get(&b).ok_or_else(|| eyre::eyre!("missing witnesses for block {}", b))?;
+        if wits.len() != user_alpha.len() {
+            bail!("witness length mismatch at block {}", b);
         }
-        let dt_q = t_us(t_q);
-        emit(
-            "[ProofServerHistoryPerQuery]",
-            block,
-            ps.n,
-            user_pos.len(), // user α
-            0,
-            dt_q,
-        );
-
         out_all.push(ProofServerHistoryOut {
             user_id: user_id.clone(),
-            block,
+            block: b,
             indices: user_alpha.clone(),
-            values_hex: user_vals,
-            witnesses_hex: user_wits,
-            commitment_hex: ps.gc_hex.clone(),
+            witnesses_hex: wits.iter().map(g1_to_hex).collect(),
         });
     }
-    
     out_all.sort_by_key(|o| o.block);
+    let json = serde_json::to_vec_pretty(&out_all)?;
+    fs::write(&out, &json)?;
 
-
-    let micros = t_us(t0);
-    // Core history algorithm latency (does NOT include state/SRS load or journal scan)
-    emit(
-        "[ProofServerHistoryCore]",
-        0,                         // block field not meaningful here
-        ps.n,                      // n = vector size
-        ps.alpha_indices.len(),    // alpha = union α size
-        out_all.len(),             // beta field reused as "queries" = #blocks
-        micros,
-    );
-    eprintln!(
-        "[ProofServerHistory] core queries={} micros={}",
-        out_all.len(),
-        micros
-    );
- let json = serde_json::to_vec_pretty(&out_all)?;
-    let payload_bytes = json.len() as usize;
-
-    emit(
-        "[ProofServerHistoryPayload]",
-        0,
-        ps.n,
-        ps.alpha_indices.len(), // union α
-        payload_bytes,          // β used as size
-        0,
-    );
-    // ---- Write output ----
-    fs::write(&out, serde_json::to_vec_pretty(&out_all)?)?;
-    eprintln!(
-        "[ProofServerHistory] user={} blocks={} -> {}",
-        user_id,
-        out_all.len(),
-        out.display()
-    );
-    let total_micros = t_us(t_total);
-    emit(
-        "[ProofServerHistoryTotal]",
-        0,
-        ps.n,
-        ps.alpha_indices.len(),
-        out_all.len(),
-        total_micros,
-    );
-    eprintln!(
-        "[ProofServerHistory] total queries={} micros={}",
-        out_all.len(),
-        total_micros
-    );
+    emit("[HistoryPayloadWrite]", 0, ps.n, user_alpha.len(), json.len(), t_us(t_payload));
+    emit("[HistoryTotal]", 0, ps.n, user_alpha.len(), 0, t_us(t_total));
     Ok(())
 }
 
+fn pinned_commitment_at(journal: &Path, srs_id: &str, n: usize, logn: usize, block: u64) -> Result<String> {
+    let mut out: Option<String> = None;
+    buvc_rs::journal::for_each_line_filtered(journal, srs_id, n, logn, |j: JournalLine| {
+        if j.block_number == block {
+            if let Some(gc) = j.gc_hex.clone() {
+                out = Some(gc);
+            } else {
+                bail!("journal line for block {} missing pinned gc_hex", block);
+            }
+        }
+        Ok(())
+    })?;
+    out.ok_or_else(|| eyre::eyre!("no journal entry for block {}", block))
+}
 
 /* ------------------------------------------------------------- */
-/* User verification                                              */
+/* External value claims for verification                          */
 /* ------------------------------------------------------------- */
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct ValueClaim {
+    pub block: u64,
+    pub values_hex: Vec<String>,
+}
+
 fn cmd_user_verify(
     logn: usize,
     srs: PathBuf,
+    journal: PathBuf,
+    user_state: PathBuf,
     history: PathBuf,
+    claims: Option<PathBuf>,
 ) -> Result<()> {
-    // Load history produced by proof-server-history
-    let hist: Vec<ProofServerHistoryOut> =
-        serde_json::from_slice(&fs::read(&history)?)?;
+    let hist: Vec<ProofServerHistoryOut> = serde_json::from_slice(&fs::read(&history)?)?;
+    if hist.is_empty() {
+        bail!("empty history");
+    }
 
-    let (vp, _) = load_or_create_srs(&srs, logn)?;
+    let us: UserState = serde_json::from_slice(&fs::read(&user_state)?)?;
+    if us.logn != logn {
+        bail!("user_state logn mismatch");
+    }
+
+    let (vp, srs_id) = load_or_create_srs(&srs, logn)?;
+    if us.srs_id != srs_id {
+        bail!("SRS id mismatch user_state ({}) vs srs.bin ({})", us.srs_id, srs_id);
+    }
     let ctx = make_ctx(&vp, logn);
-
-    // n = vector size (for metrics)
     let n = 1usize << logn;
+    let mut claim_map: HashMap<u64, Vec<Fr>> = HashMap::new();
+    if let Some(p) = claims {
+        let v: Vec<ValueClaim> = serde_json::from_slice(&fs::read(&p)?)?;
+        for c in v {
+            let mut vals = Vec::<Fr>::with_capacity(c.values_hex.len());
+            for hx in c.values_hex {
+                vals.push(fr_from_hex(&hx)?);
+            }
+            claim_map.insert(c.block, vals);
+        }
+    } else {
+        bail!(
+            "No values available for verification.\n\
+             Provide --claims <json> (recommended)."
+        );
+    }
 
-    // ---- totals for [UserVerifyTotal] ----
     let mut total_alpha = 0usize;
     let mut proofs = 0usize;
     let t_total = t_start();
 
     for h in hist {
-        let gc = g1_from_hex(&h.commitment_hex)?;
+        if h.indices != us.alpha_indices {
+            bail!("history indices != user_state alpha_indices at block {}", h.block);
+        }
+        if h.witnesses_hex.len() != h.indices.len() {
+            bail!("witness length mismatch at block {}", h.block);
+        }
 
-        let mut vals = Vec::<Fr>::new();
-        let mut gqs = Vec::<G1>::new();
+        let gc_hex = pinned_commitment_at(&journal, &us.srs_id, n, logn, h.block)?;
+        let gc = g1_from_hex(&gc_hex)?;
 
-        for (v_hex, w_hex) in h.values_hex.iter().zip(h.witnesses_hex.iter()) {
-            vals.push(fr_from_hex(v_hex)?);
+        let vals = claim_map.get(&h.block).ok_or_else(|| eyre::eyre!("missing value claim for block {}", h.block))?;
+        if vals.len() != h.indices.len() {
+            bail!("value claim length mismatch at block {}", h.block);
+        }
+
+        let mut gqs = Vec::<G1>::with_capacity(h.witnesses_hex.len());
+        for w_hex in &h.witnesses_hex {
             gqs.push(g1_from_hex(w_hex)?);
         }
 
         let t0 = t_start();
         let agg = ctx.aggregate_proof(&h.indices, &gqs);
-        let ok = ctx.verify_multi(&vp, gc, &h.indices, &vals, agg);
+        let ok = ctx.verify_multi(&vp, gc, &h.indices, vals, agg);
         let dt = t_us(t0);
 
-        emit(
-            "[UserVerify]",
-            h.block,
-            n,
-            h.indices.len(), // alpha = #indices checked in this proof
-            0,               // beta not meaningful here
-            dt,
-        );
+        emit("[UserVerify]", h.block, n, h.indices.len(), 0, dt);
+        println!("user={} block={} verify_multi={} micros={}", h.user_id, h.block, ok, dt);
 
-        println!(
-            "user={} block={} verify_multi={} micros={}",
-            h.user_id, h.block, ok, dt
-        );
-
-        // accumulate totals
         total_alpha += h.indices.len();
         proofs += 1;
     }
 
-    let total_micros = t_us(t_total);
-    emit(
-        "[UserVerifyTotal]",
-        0,
-        n,
-        total_alpha, // total α checked across all proofs
-        proofs,      // β reused as "#proofs"
-        total_micros,
-    );
-
+    emit("[UserVerifyTotal]", 0, n, total_alpha, proofs, t_us(t_total));
     Ok(())
 }
