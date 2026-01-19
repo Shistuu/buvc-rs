@@ -1,47 +1,48 @@
 use ark_bls12_381::{fr::Fr, G1Projective as G1};
 use ark_ff::Zero;
 
-use crate::{vc_context::VcContext, types::{HistoryOp, HistoryQueryResult}};
+use crate::{
+    vc_context::VcContext,
+    types::{HistoryOp, HistoryQueryResult},
+};
 
+/// Merge two sorted (beta, delta) lists
 fn merge_beta_delta(
     beta_a: &[usize],
     delta_a: &[Fr],
     beta_b: &[usize],
     delta_b: &[Fr],
 ) -> (Vec<usize>, Vec<Fr>) {
-    debug_assert_eq!(beta_a.len(), delta_a.len());
-    debug_assert_eq!(beta_b.len(), delta_b.len());
-
     let mut out_b = Vec::with_capacity(beta_a.len() + beta_b.len());
     let mut out_d = Vec::with_capacity(beta_a.len() + beta_b.len());
 
     let mut i = 0usize;
     let mut j = 0usize;
+
     while i < beta_a.len() && j < beta_b.len() {
-        let ba = beta_a[i];
-        let bb = beta_b[j];
-        if ba == bb {
+        if beta_a[i] == beta_b[j] {
             let d = delta_a[i] + delta_b[j];
             if !d.is_zero() {
-                out_b.push(ba);
+                out_b.push(beta_a[i]);
                 out_d.push(d);
             }
             i += 1;
             j += 1;
-        } else if ba < bb {
+        } else if beta_a[i] < beta_b[j] {
             if !delta_a[i].is_zero() {
-                out_b.push(ba);
+                out_b.push(beta_a[i]);
                 out_d.push(delta_a[i]);
             }
             i += 1;
         } else {
             if !delta_b[j].is_zero() {
-                out_b.push(bb);
+                out_b.push(beta_b[j]);
                 out_d.push(delta_b[j]);
             }
             j += 1;
         }
     }
+
     while i < beta_a.len() {
         if !delta_a[i].is_zero() {
             out_b.push(beta_a[i]);
@@ -49,6 +50,7 @@ fn merge_beta_delta(
         }
         i += 1;
     }
+
     while j < beta_b.len() {
         if !delta_b[j].is_zero() {
             out_b.push(beta_b[j]);
@@ -60,162 +62,52 @@ fn merge_beta_delta(
     (out_b, out_d)
 }
 
-/// Canonicalize a (beta,delta) by sorting and summing duplicates.
-fn canonicalize_beta_delta(beta: &[usize], delta: &[Fr]) -> (Vec<usize>, Vec<Fr>) {
-    debug_assert_eq!(beta.len(), delta.len());
-
-    // beta sizes per block are small; O(k log k) here is fine
-    let mut pairs: Vec<(usize, Fr)> = beta.iter().copied().zip(delta.iter().copied()).collect();
-    pairs.sort_by_key(|(b, _)| *b);
-
-    let mut out_b: Vec<usize> = Vec::with_capacity(pairs.len());
-    let mut out_d: Vec<Fr> = Vec::with_capacity(pairs.len());
-
-    let mut i = 0usize;
-    while i < pairs.len() {
-        let b = pairs[i].0;
-        let mut acc = pairs[i].1;
-        i += 1;
-        while i < pairs.len() && pairs[i].0 == b {
-            acc += pairs[i].1;
-            i += 1;
-        }
-        if !acc.is_zero() {
-            out_b.push(b);
-            out_d.push(acc);
-        }
-    }
-
-    (out_b, out_d)
-}
-
-#[derive(Clone, Debug)]
-struct Node {
-    l: usize,
-    r: usize,
-    has_query: bool,
-    beta: Vec<usize>,
-    delta: Vec<Fr>,
-    left: Option<Box<Node>>,
-    right: Option<Box<Node>>,
-}
-
-fn build_node(stream: &[HistoryOp], l: usize, r: usize) -> Node {
-    debug_assert!(l < r);
-
-    if r - l == 1 {
-        match &stream[l] {
-            HistoryOp::Query { .. } => Node {
-                l,
-                r,
-                has_query: true,
-                beta: Vec::new(),
-                delta: Vec::new(),
-                left: None,
-                right: None,
-            },
-            HistoryOp::Update { beta, delta } => {
-                let (b, d) = canonicalize_beta_delta(beta, delta);
-                Node {
-                    l,
-                    r,
-                    has_query: false,
-                    beta: b,
-                    delta: d,
-                    left: None,
-                    right: None,
-                }
-            }
-        }
-    } else {
-        let m = l + (r - l) / 2;
-        let left = build_node(stream, l, m);
-        let right = build_node(stream, m, r);
-
-        let has_query = left.has_query || right.has_query;
-        let (beta, delta) = merge_beta_delta(&left.beta, &left.delta, &right.beta, &right.delta);
-
-        Node {
-            l,
-            r,
-            has_query,
-            beta,
-            delta,
-            left: Some(Box::new(left)),
-            right: Some(Box::new(right)),
-        }
-    }
-}
-/// Recurse over history tree, updating witnesses and collecting query results
-fn vupdate_run(
-    ctx: &VcContext,
-    stream: &[HistoryOp],
-    node: &Node,
-    alpha_all: &[usize],
-    gq_live: &[G1],
-    out: &mut Vec<HistoryQueryResult>,
-) {
-    if !node.has_query {
-        return;
-    }
-
-    // leaf
-    if node.r - node.l == 1 {
-        if let HistoryOp::Query { query_id } = &stream[node.l] {
-            out.push(HistoryQueryResult {
-                query_id: *query_id,
-                indices: alpha_all.to_vec(),
-                proofs: gq_live.to_vec(),
-            });
-        }
-        return;
-    }
-
-    let left = node.left.as_ref().expect("internal node missing left");
-    let right = node.right.as_ref().expect("internal node missing right");
-
-    // Left recurse (no witness changes before left)
-    if left.has_query {
-        vupdate_run(ctx, stream, left, alpha_all, gq_live, out);
-    }
-
-    // Right recurse: apply left updates to witnesses, then recurse right
-    if right.has_query {
-        let mut gq_r = gq_live.to_vec();
-
-        if !left.beta.is_empty() && !alpha_all.is_empty() {
-            gq_r = ctx.update_witnesses_batch(alpha_all, &gq_r, &left.beta, &left.delta);
-        }
-
-        vupdate_run(ctx, stream, right, alpha_all, &gq_r, out);
-    }
-}
-
-/// Update witnesses for same alpha across history stream
+/// Apply history updates lazily (paper-faithful)
 pub fn vupdate_history_same_alpha(
     ctx: &VcContext,
-    alpha_all: &[usize],
-    gq_alpha_final: &[G1],
-    stream_reversed: &[HistoryOp],
+    alpha: &[usize],
+    gq_head: &[G1],
+    stream_rev: &[HistoryOp],
 ) -> Vec<HistoryQueryResult> {
-    if stream_reversed.is_empty() {
-        return Vec::new();
-    }
-    debug_assert_eq!(alpha_all.len(), gq_alpha_final.len());
-
-    let root = build_node(stream_reversed, 0, stream_reversed.len());
-    if !root.has_query {
-        return Vec::new();
-    }
-
     let mut out = Vec::new();
-    vupdate_run(
-        ctx,
-        stream_reversed,
-        &root,
-        alpha_all,
-        gq_alpha_final,
-        &mut out,
-    );
+    let mut gq_live = gq_head.to_vec();
+
+    let mut acc_beta: Vec<usize> = Vec::new();
+    let mut acc_delta: Vec<Fr> = Vec::new();
+
+    for op in stream_rev {
+        match op {
+            HistoryOp::Update { beta, delta } => {
+                let (b, d) = merge_beta_delta(
+                    &acc_beta,
+                    &acc_delta,
+                    beta,
+                    delta,
+                );
+                acc_beta = b;
+                acc_delta = d;
+            }
+
+            HistoryOp::Query { query_id } => {
+                if !acc_beta.is_empty() {
+                    gq_live = ctx.update_witnesses_batch(
+                        alpha,
+                        &gq_live,
+                        &acc_beta,
+                        &acc_delta,
+                    );
+                    acc_beta.clear();
+                    acc_delta.clear();
+                }
+
+                out.push(HistoryQueryResult {
+                    query_id: *query_id,
+                    indices: alpha.to_vec(),
+                    proofs: gq_live.clone(),
+                });
+            }
+        }
+    }
+
     out
 }
