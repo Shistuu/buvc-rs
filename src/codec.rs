@@ -3,15 +3,10 @@ use ark_bls12_381::{fr::Fr, G1Projective as G1};
 use ark_ff::PrimeField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ethers_core::{
-    types::{Address, U256},
+    types::{U256},
     utils::keccak256,
 };
 use eyre::{bail, Result};
-use std::str::FromStr;
-
-pub fn u256_from_dec(s: &str) -> Result<U256> {
-    Ok(U256::from_dec_str(s)?)
-}
 
 pub fn fr_from_hex(hex_str: &str) -> Result<Fr> {
     let bytes = hex::decode(hex_str.trim_start_matches("0x"))?;
@@ -38,33 +33,10 @@ pub fn g1_to_hex(g: &G1) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
-pub fn parse_addr_list(s: &str) -> Result<Vec<Address>> {
-    s.split(',')
-        .map(|t| Address::from_str(t.trim()).map_err(|e| eyre::eyre!("bad addr '{}': {}", t, e)))
-        .collect()
-}
-
 pub fn keccak_hex(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(keccak256(bytes)))
 }
 
-/// Minimal application mapping (paper assumes indices exist):
-/// i = keccak(address) mod N
-pub fn addr_to_index(addr: Address, n: usize) -> Result<usize> {
-    if n == 0 {
-        bail!("N must be > 0");
-    }
-    let h = keccak256(addr.as_bytes());
-    // use low 64 bits of hash (any deterministic slice works)
-    let x = u64::from_be_bytes(h[24..32].try_into().unwrap());
-    Ok((x as usize) % n)
-}
-
-/// Convert U256 -> Fr EXACTLY, requiring x < Fr::MODULUS.
-/// If not, bail (so you never silently mod-reduce Ethereum balances).
-///
-/// NOTE: The `words_le` array below is ONLY arkworks' internal BigInt representation
-/// (4 machine words for a ~256-bit integer). This is NOT "limb-based vector encoding".
 pub fn fr_from_u256_exact(x: U256) -> Result<Fr> {
     // U256 -> 32-byte big-endian
     let mut be = [0u8; 32];

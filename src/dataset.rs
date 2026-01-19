@@ -1,22 +1,12 @@
 // src/dataset.rs
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ethers_core::types::{Address, U256};
 use eyre::{bail, Result};
 
-#[derive(Clone, Debug)]
-pub struct Entry {
-    pub address: Address,
-    pub balance: U256,
-}
-
-pub struct DatasetReader {
-    dir: PathBuf,
-    segment_size: u32,
-    current_segment: Option<SegmentReader>,
-}
+use crate::types::{Entry, DatasetReader, SegmentReader};
 
 impl DatasetReader {
     pub fn new<P: AsRef<Path>>(dir: P, segment_size: u32) -> Self {
@@ -82,14 +72,6 @@ impl DatasetReader {
         self.current_segment = Some(SegmentReader::open(&self.dir, base, end)?);
         Ok(())
     }
-}
-
-struct SegmentReader {
-    base: u32,
-    end: u32,
-    dat_file: File,
-    offsets: Vec<u64>,
-    last_written: u32,
 }
 
 impl SegmentReader {

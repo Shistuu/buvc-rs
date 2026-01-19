@@ -16,13 +16,14 @@ use buvc_rs::codec::{
     delta_fr, fr_from_hex, fr_from_u256_exact, fr_to_hex, g1_from_hex, g1_to_hex
 };
 use buvc_rs::snapshot_vals;
-use buvc_rs::dataset_helpers::StateTracker;
-use buvc_rs::history::{vupdate_history_same_alpha, HistoryOp};
-use buvc_rs::indexer::Indexer;
+use buvc_rs::StateTracker;
+use buvc_rs::history::vupdate_history_same_alpha;
+use buvc_rs::HistoryOp;
+use buvc_rs::Indexer;
 use buvc_rs::journal::append_line;
 use buvc_rs::srs::{load_or_create_srs, make_ctx};
-use buvc_rs::types::{JournalLine, SnapshotOut, UserState};
-use buvc_rs::proof_server::ProofServerState;
+use buvc_rs::{JournalLine, SnapshotOut, UserState};
+use buvc_rs::ProofServerState;
 
 
 fn t_start() -> Instant {
@@ -293,7 +294,7 @@ fn main() -> Result<()> {
 }
 
 fn cmd_build_universe(dataset_dir: PathBuf, start_block: u64, end_block: u64, out: PathBuf) -> Result<()> {
-    let mut dataset = buvc_rs::dataset::DatasetReader::new(&dataset_dir, 100_000);
+    let mut dataset = buvc_rs::DatasetReader::new(&dataset_dir, 100_000);
     let mut addrs = HashSet::<Address>::new();
 
     dataset.iterate_range(start_block as u32, end_block as u32, |_, entries| {
@@ -460,9 +461,6 @@ fn cmd_issue_user_state(
         bail!("addresses file is empty");
     }
 
-    let mut alpha_indices = Vec::with_capacity(addrs.len());
-    let mut alpha_addresses = Vec::with_capacity(addrs.len());
-
     let mut set = std::collections::BTreeSet::new();
     for a in addrs {
         let i = indexer.index_of(a)?;
@@ -494,6 +492,7 @@ if g1_to_hex(&gc_rebuilt) != snap.gc_hex {
 }
 println!("snapshot gc = {}", snap.gc_hex);
 println!("rebuilt  gc = {}", g1_to_hex(&gc_rebuilt));
+let alpha_len = alpha_indices.len();
 
    let us = UserState {
     n,
@@ -515,7 +514,7 @@ println!("rebuilt  gc = {}", g1_to_hex(&gc_rebuilt));
     "[IssueUserState]",
     snap.block_number,
     n,
-    alpha_indices.len(),
+    alpha_len,
     0,
     t_us(t0),
 );
@@ -699,7 +698,6 @@ fn cmd_proof_server_export_user_state(
         gc_hex: String::new(),
     
         alpha_indices: user_alpha.clone(),
-        alpha_addresses: Vec::new(),
     
         alpha_witnesses_hex: gq_head.iter().map(g1_to_hex).collect(),
     

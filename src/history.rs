@@ -2,20 +2,7 @@ use ark_bls12_381::{fr::Fr, G1Projective as G1};
 use ark_ff::{Zero};
 
 use crate::vc_context::VcContext;
-
-#[derive(Clone, Debug)]
-pub enum HistoryOp {
-    Update { beta: Vec<usize>, delta: Vec<Fr> },
-    Query { query_id: usize },
-}
-
-/// Result for a single history query: indices α and their witnesses.
-#[derive(Clone, Debug)]
-pub struct HistoryQueryResult {
-    pub query_id: usize,
-    pub indices: Vec<usize>, // α
-    pub proofs: Vec<G1>,     // witnesses for α, same order
-}
+use crate::types::{HistoryOp, HistoryQueryResult};
 
 fn merge_beta_delta(
     beta_a: &[usize],

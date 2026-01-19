@@ -2,12 +2,7 @@
 use ethers_core::types::Address;
 use eyre::{bail, Result};
 use std::collections::HashMap;
-
-#[derive(Clone, Debug)]
-pub struct Indexer {
-    pub n: usize,
-    pub addr_to_idx: HashMap<Address, usize>,
-}
+use crate::types::Indexer;
 
 impl Indexer {
     /// Collision-free: idx = position in sorted universe list.

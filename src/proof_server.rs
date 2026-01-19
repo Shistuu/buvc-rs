@@ -1,40 +1,13 @@
 // src/proof_server.rs
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
 use eyre::{bail, Result};
 
-use crate::types::UserState;
+use crate::types::{UserState, ProofServerUser, ProofServerState};
 
 /// Paper-faithful proof-server state:
 /// - maintains witnesses for UNION α across subscribed users
 /// - does NOT store or update values
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProofServerUser {
-    pub user_id: String,
-    pub alpha_indices: Vec<usize>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProofServerState {
-    pub n: usize,
-    pub logn: usize,
-    pub srs_id: String,
-
-    /// Latest block server is synced to
-    pub last_block: u64,
-
-    /// Commitment at last_block (optional but useful for sanity checks)
-    pub gc_hex: String,
-
-    /// UNION α across all users
-    pub alpha_indices: Vec<usize>,
-
-    /// Witnesses for UNION α at last_block
-    pub alpha_witnesses_hex: Vec<String>,
-
-    pub users: Vec<ProofServerUser>,
-}
 
 impl ProofServerState {
     pub fn from_user_states(users: &[(String, UserState)]) -> Result<Self> {
