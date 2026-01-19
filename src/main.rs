@@ -24,9 +24,6 @@ use buvc_rs::srs::{load_or_create_srs, make_ctx};
 use buvc_rs::types::{JournalLine, SnapshotOut, UserState};
 use buvc_rs::proof_server::ProofServerState;
 
-/* ------------------------------------------------------------- */
-/* Timing + metrics                                              */
-/* ------------------------------------------------------------- */
 
 fn t_start() -> Instant {
     Instant::now()
@@ -53,15 +50,12 @@ struct JournalLineLite {
     pub srs_id: String,
     pub changed_indices: Vec<usize>,
     pub delta_hex: Vec<String>,
+}
 
 fn emit(phase: &'static str, block: u64, n: usize, alpha: usize, beta: usize, micros: u128) {
     let m = Metric { phase, block, n, alpha, beta, micros };
     println!("METRIC {}", serde_json::to_string(&m).unwrap());
 }
-
-/* ------------------------------------------------------------- */
-/* Helpers                                                       */
-/* ------------------------------------------------------------- */
 
 fn canonicalize_beta_delta(beta: &[usize], delta: &[Fr]) -> (Vec<usize>, Vec<Fr>) {
     let mut acc: BTreeMap<usize, Fr> = BTreeMap::new();
@@ -90,9 +84,6 @@ fn read_addresses_file(path: &Path) -> eyre::Result<Vec<Address>> {
     }
     Ok(out)
 }
-/* ------------------------------------------------------------- */
-/* CLI                                                           */
-/* ------------------------------------------------------------- */
 
 #[derive(Parser, Debug)]
 #[command(name = "cauchy-runner")]
@@ -146,6 +137,22 @@ enum Cmd {
         end_block: u64,
         #[arg(long)]
         journal: PathBuf,
+    },
+    IssueUserState {
+        #[arg(long)]
+        logn: usize,
+        #[arg(long)]
+        srs: PathBuf,
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long)]
+        universe_file: PathBuf,
+        #[arg(long)]
+        addresses: PathBuf,
+        #[arg(long)]
+        snapshot_vals: PathBuf, 
+        #[arg(long)]
+        out: PathBuf,
     },
 
        ProofServerInit {
@@ -243,7 +250,26 @@ fn main() -> Result<()> {
         Cmd::PublisherAdvance { logn, srs, dataset_dir, universe_file, snapshot, snapshot_vals, end_block, journal } => {
             cmd_publisher_advance(logn, srs, dataset_dir, universe_file, snapshot, snapshot_vals, end_block, journal)
         }
-    
+        Cmd::IssueUserState {
+            logn,
+            srs,
+            snapshot,
+            universe_file,
+            addresses,
+            snapshot_vals,
+            out,
+        } => {
+            cmd_issue_user_state(
+                logn,
+                srs,
+                snapshot,
+                universe_file,
+                addresses,
+                snapshot_vals,
+                out,
+
+            )
+        }
         Cmd::ProofServerInit { logn, srs, snapshot, user_id, user_state, out } => {
             cmd_proof_server_init(logn, srs, snapshot, user_id, user_state, out)
         }
@@ -263,7 +289,7 @@ fn main() -> Result<()> {
         Cmd::UserVerify { logn, srs, journal, user_state, history, claims } => {
             cmd_user_verify(logn, srs, journal, user_state, history, claims)
         }
-    }    
+    }
 }
 
 fn cmd_build_universe(dataset_dir: PathBuf, start_block: u64, end_block: u64, out: PathBuf) -> Result<()> {
@@ -402,9 +428,100 @@ fn cmd_publisher_advance(
         emit("[PublisherAdvance] block", cur, n, 0, delta.len(), t_us(t0));
         emit("[CommitUpdate] block", cur, n, 0, delta.len(), t2);
     }
-
+    
     Ok(())
 }
+
+fn cmd_issue_user_state(
+    logn: usize,
+    srs: PathBuf,
+    snapshot: PathBuf,
+    universe_file: PathBuf,
+    addresses: PathBuf,
+    snapshot_vals: PathBuf, 
+    out: PathBuf,
+) -> Result<()> {
+    let t0 = t_start();
+    let n = 1usize << logn;
+
+    let (vp, srs_id) = load_or_create_srs(&srs, logn)?;
+    let ctx = make_ctx(&vp, logn);
+
+    let snap: SnapshotOut = serde_json::from_slice(&fs::read(&snapshot)?)?;
+    if snap.logn != logn || snap.srs_id != srs_id {
+        bail!("snapshot / srs mismatch");
+    }
+
+    let universe = read_addresses_file(&universe_file)?;
+    let indexer = Indexer::from_universe_sequential(&universe, n)?;
+
+    let addrs = read_addresses_file(&addresses)?;
+    if addrs.is_empty() {
+        bail!("addresses file is empty");
+    }
+
+    let mut alpha_indices = Vec::with_capacity(addrs.len());
+    let mut alpha_addresses = Vec::with_capacity(addrs.len());
+
+    let mut set = std::collections::BTreeSet::new();
+    for a in addrs {
+        let i = indexer.index_of(a)?;
+        set.insert(i);
+    }
+    let alpha_indices: Vec<usize> = set.into_iter().collect();
+
+
+
+    // Load snapshot values (this is REQUIRED in Cauchy)
+    let bals = snapshot_vals::read_u256hex_lines(&snapshot_vals)?;
+    if bals.len() != universe.len() {
+        bail!("snapshot_vals length mismatch");
+    }
+
+    let mut v = vec![Fr::ZERO; n];
+    for (a, bal) in universe.iter().zip(bals.into_iter()) {
+        let i = indexer.index_of(*a)?;
+        v[i] = fr_from_u256_exact(bal)?;
+    }
+
+    // Paper-faithful: compute commitment + witness together
+   let (gc_rebuilt, gq_alpha) =
+    ctx.build_commitment_for_alpha(&v, &alpha_indices);
+
+
+if g1_to_hex(&gc_rebuilt) != snap.gc_hex {
+    bail!("rebuilt snapshot commitment mismatch");
+}
+println!("snapshot gc = {}", snap.gc_hex);
+println!("rebuilt  gc = {}", g1_to_hex(&gc_rebuilt));
+
+   let us = UserState {
+    n,
+    logn,
+    srs_id,
+    last_block: snap.block_number,
+    gc_hex: snap.gc_hex.clone(),
+    alpha_indices,
+    alpha_witnesses_hex: gq_alpha.iter().map(g1_to_hex).collect(),
+    universe_mode: "external".into(),
+    witness_mode: "from_snapshot".into(),
+};
+
+        
+
+    fs::write(&out, serde_json::to_vec_pretty(&us)?)?;
+
+   emit(
+    "[IssueUserState]",
+    snap.block_number,
+    n,
+    alpha_indices.len(),
+    0,
+    t_us(t0),
+);
+    Ok(())
+}
+
 
 fn cmd_proof_server_init(
     logn: usize,

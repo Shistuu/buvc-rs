@@ -251,5 +251,5 @@ fn segment_bounds(block: u32, segment_size: u32) -> (u32, u32) {
 }
 
 fn segment_name(base: u32, end: u32, ext: &str) -> String {
-    format!("blk_{:08}_{:08}.{}", base, end, ext)
+    format!("blk_{}_{}.{}", base, end, ext)
 }
