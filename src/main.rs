@@ -23,7 +23,7 @@ use buvc_rs::{
     },
     snapshot_vals,
     StateTracker,
-    history::vupdate_history_same_alpha,
+    history::vupdate_history_vupdate_dc_fast,
     HistoryOp,
     Indexer,
     journal::append_line,
@@ -633,12 +633,24 @@ fn cmd_proof_server_history(
     if ps.alpha_indices.len() != ps.alpha_witnesses_hex.len() {
         bail!("alpha_indices / alpha_witnesses mismatch");
     }
-
-    let (vp, srs_id) = load_or_create_srs(&srs, logn)?;
-    if ps.srs_id != srs_id {
-        bail!("srs_id mismatch");
-    }
+    let t_srs = t_start();
+    let (vp, _srs_id) = load_or_create_srs(&srs, logn)?;
+    let srs_us = t_us(t_srs);
+    
+    emit(
+        "[SRSLoad]",
+        0,                // block irrelevant here
+        1usize << logn,   // n
+        0,                // alpha not applicable
+        0,                // beta not applicable
+        srs_us,
+    );
+    
+    let t_ctx = t_start();
     let ctx = make_ctx(&vp, logn);
+    emit("[MakeCtx]", 0, 1usize << logn, 0, 0, t_us(t_ctx));
+
+    
 
     let (user_alpha, user_pos_in_union) = ps
         .user_alpha(&user_id)
@@ -739,7 +751,13 @@ fn cmd_proof_server_history(
     emit("[HistoryBuildStream]", 0, ps.n, user_alpha.len(), stream_rev.len(), t_us(t_build));
 
     let t_vu = t_start();
-    let vu = vupdate_history_same_alpha(&ctx, &user_alpha, &user_gq_head, &stream_rev);
+    let vu = vupdate_history_vupdate_dc_fast(
+        &ctx,
+        &user_alpha,
+        &user_gq_head,
+        &stream_rev,
+    );
+    
     emit("[HistoryVUpdateUserAlpha]", 0, ps.n, user_alpha.len(), vu.len(), t_us(t_vu));
 
     let mut by_block: HashMap<u64, Vec<G1>> = HashMap::new();
