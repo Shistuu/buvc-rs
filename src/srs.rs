@@ -1,11 +1,12 @@
-// src/srs.rs
-use crate::codec::keccak_hex;
-use crate::vc_context::VcContext;
-use crate::vc_parameter::VcParameter;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use eyre::{bail, Result};
+
 use std::{fs, path::Path};
 
+use eyre::{bail, Result};
+
+use crate::{codec::keccak_hex, vc_context::VcContext, vc_parameter::VcParameter};
+
+/// Load existing SRS or generate new one if not found
 pub fn load_or_create_srs(path: &Path, logn: usize) -> Result<(VcParameter, String)> {
     eprintln!("SRS: requested path={:?}, logn={}", path, logn);
 

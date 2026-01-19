@@ -1,4 +1,3 @@
-// src/lib.rs
 pub mod poly;
 pub mod vc_context;
 pub mod vc_parameter;

@@ -1,13 +1,10 @@
-// src/snapshot_vals.rs
-use std::{
-    fs::File,
-    io::{BufRead, BufReader},
-    path::Path,
-};
+use std::{fs::File, io::{BufRead, BufReader}, path::Path};
 
 use ethers_core::types::U256;
+
 use eyre::{bail, Result};
 
+/// Read U256 values from hex-formatted file
 pub fn read_u256hex_lines(path: &Path) -> Result<Vec<U256>> {
     let f = File::open(path)?;
     let rd = BufReader::new(f);

@@ -1,7 +1,9 @@
-// src/indexer.rs
-use ethers_core::types::Address;
-use eyre::{bail, Result};
 use std::collections::HashMap;
+
+use ethers_core::types::Address;
+
+use eyre::{bail, Result};
+
 use crate::types::Indexer;
 
 impl Indexer {
@@ -26,6 +28,7 @@ impl Indexer {
         Ok(Self { n, addr_to_idx })
     }
 
+    /// Get index of address in universe
     #[inline]
     pub fn index_of(&self, a: Address) -> Result<usize> {
         self.addr_to_idx

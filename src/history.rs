@@ -1,8 +1,7 @@
 use ark_bls12_381::{fr::Fr, G1Projective as G1};
-use ark_ff::{Zero};
+use ark_ff::Zero;
 
-use crate::vc_context::VcContext;
-use crate::types::{HistoryOp, HistoryQueryResult};
+use crate::{vc_context::VcContext, types::{HistoryOp, HistoryQueryResult}};
 
 fn merge_beta_delta(
     beta_a: &[usize],
@@ -62,7 +61,6 @@ fn merge_beta_delta(
 }
 
 /// Canonicalize a (beta,delta) by sorting and summing duplicates.
-/// This is used at UPDATE leaves (typically tiny per-block).
 fn canonicalize_beta_delta(beta: &[usize], delta: &[Fr]) -> (Vec<usize>, Vec<Fr>) {
     debug_assert_eq!(beta.len(), delta.len());
 
@@ -94,13 +92,10 @@ fn canonicalize_beta_delta(beta: &[usize], delta: &[Fr]) -> (Vec<usize>, Vec<Fr>
 #[derive(Clone, Debug)]
 struct Node {
     l: usize,
-    r: usize, // [l, r)
+    r: usize,
     has_query: bool,
-
-    // merged updates (β,Δ) for updates in [l,r), sorted by β, unique
     beta: Vec<usize>,
     delta: Vec<Fr>,
-
     left: Option<Box<Node>>,
     right: Option<Box<Node>>,
 }
@@ -151,11 +146,7 @@ fn build_node(stream: &[HistoryOp], l: usize, r: usize) -> Node {
         }
     }
 }
-
-/// Paper-faithful recursion:
-/// - recurse left with current witnesses
-/// - update witnesses by left updates
-/// - recurse right with updated witnesses
+/// Recurse over history tree, updating witnesses and collecting query results
 fn vupdate_run(
     ctx: &VcContext,
     stream: &[HistoryOp],
@@ -200,6 +191,7 @@ fn vupdate_run(
     }
 }
 
+/// Update witnesses for same alpha across history stream
 pub fn vupdate_history_same_alpha(
     ctx: &VcContext,
     alpha_all: &[usize],

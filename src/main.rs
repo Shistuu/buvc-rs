@@ -1,30 +1,37 @@
-// src/main.rs
 use ark_bls12_381::{fr::Fr, G1Projective as G1};
 use ark_ff::{Field, Zero};
-use clap::{Parser, Subcommand};
+
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fs,
+    io::{BufRead, Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Instant,
+};
+
+use clap::Parser;
+
 use ethers_core::types::Address;
+
 use eyre::{bail, Result};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
-use std::io::{BufRead, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::time::Instant;
 
-use buvc_rs::codec::{
-    delta_fr, fr_from_hex, fr_from_u256_exact, fr_to_hex, g1_from_hex, g1_to_hex
+use buvc_rs::{
+    codec::{
+        fr_from_hex,fr_from_u256_exact, fr_to_hex, g1_from_hex, g1_to_hex, delta_fr,
+    },
+    snapshot_vals,
+    StateTracker,
+    history::vupdate_history_same_alpha,
+    HistoryOp,
+    Indexer,
+    journal::append_line,
+    srs::{load_or_create_srs, make_ctx},
+    JournalLine, SnapshotOut, UserState,
+    ProofServerState,
+    types::{Metric, Cli, Cmd, JournalLineLite, ProofServerHistoryOut, ValueClaim},
 };
-use buvc_rs::snapshot_vals;
-use buvc_rs::StateTracker;
-use buvc_rs::history::vupdate_history_same_alpha;
-use buvc_rs::HistoryOp;
-use buvc_rs::Indexer;
-use buvc_rs::journal::append_line;
-use buvc_rs::srs::{load_or_create_srs, make_ctx};
-use buvc_rs::{JournalLine, SnapshotOut, UserState};
-use buvc_rs::ProofServerState;
-
 
 fn t_start() -> Instant {
     Instant::now()
@@ -33,31 +40,13 @@ fn t_us(t0: Instant) -> u128 {
     t0.elapsed().as_micros() as u128
 }
 
-#[derive(serde::Serialize)]
-struct Metric {
-    phase: &'static str,
-    block: u64,
-    n: usize,
-    alpha: usize,
-    beta: usize,
-    micros: u128,
-}
-
-#[derive(Clone, Debug, serde::Deserialize)]
-struct JournalLineLite {
-    pub block_number: u64,
-    pub n: usize,
-    pub logn: usize,
-    pub srs_id: String,
-    pub changed_indices: Vec<usize>,
-    pub delta_hex: Vec<String>,
-}
-
+/// Emit metrics to stdout
 fn emit(phase: &'static str, block: u64, n: usize, alpha: usize, beta: usize, micros: u128) {
     let m = Metric { phase, block, n, alpha, beta, micros };
     println!("METRIC {}", serde_json::to_string(&m).unwrap());
 }
 
+/// Canonicalize beta-delta pairs by aggregating deltas for same beta
 fn canonicalize_beta_delta(beta: &[usize], delta: &[Fr]) -> (Vec<usize>, Vec<Fr>) {
     let mut acc: BTreeMap<usize, Fr> = BTreeMap::new();
     for (&i, &d) in beta.iter().zip(delta.iter()) {
@@ -84,155 +73,6 @@ fn read_addresses_file(path: &Path) -> eyre::Result<Vec<Address>> {
         out.push(a);
     }
     Ok(out)
-}
-
-#[derive(Parser, Debug)]
-#[command(name = "cauchy-runner")]
-struct Cli {
-    #[command(subcommand)]
-    cmd: Cmd,
-}
-
-#[derive(Subcommand, Debug)]
-enum Cmd {
-    BuildUniverse {
-        #[arg(long)]
-        dataset_dir: PathBuf,
-        #[arg(long)]
-        start_block: u64,
-        #[arg(long)]
-        end_block: u64,
-        #[arg(long)]
-        out: PathBuf,
-    },
-
-    PublisherSnapshot {
-        #[arg(long)]
-        logn: usize,
-        #[arg(long)]
-        srs: PathBuf,
-        #[arg(long)]
-        block: u64,
-        #[arg(long)]
-        universe_file: PathBuf,
-        #[arg(long)]
-        snapshot_vals: PathBuf,
-        #[arg(long)]
-        out: PathBuf,
-    },
-
-    PublisherAdvance {
-        #[arg(long)]
-        logn: usize,
-        #[arg(long)]
-        srs: PathBuf,
-        #[arg(long)]
-        dataset_dir: PathBuf,
-        #[arg(long)]
-        universe_file: PathBuf,
-        #[arg(long)]
-        snapshot: PathBuf,
-        #[arg(long)]
-        snapshot_vals: PathBuf,
-        #[arg(long)]
-        end_block: u64,
-        #[arg(long)]
-        journal: PathBuf,
-    },
-    IssueUserState {
-        #[arg(long)]
-        logn: usize,
-        #[arg(long)]
-        srs: PathBuf,
-        #[arg(long)]
-        snapshot: PathBuf,
-        #[arg(long)]
-        universe_file: PathBuf,
-        #[arg(long)]
-        addresses: PathBuf,
-        #[arg(long)]
-        snapshot_vals: PathBuf, 
-        #[arg(long)]
-        out: PathBuf,
-    },
-
-       ProofServerInit {
-        #[arg(long)]
-        logn: usize,
-        #[arg(long)]
-        srs: PathBuf,
-        #[arg(long)]
-        snapshot: PathBuf,
-        #[arg(long)]
-        user_id: Vec<String>,
-        #[arg(long)]
-        user_state: Vec<PathBuf>,
-    
-        #[arg(long)]
-        out: PathBuf,
-    },
-    
-    ProofServerAdvance {
-        #[arg(long)]
-        logn: usize,
-        #[arg(long)]
-        srs: PathBuf,
-        #[arg(long)]
-        proof_server_state: PathBuf,
-        #[arg(long)]
-        journal: PathBuf,
-        #[arg(long)]
-        end_block: u64,
-        #[arg(long)]
-        out: PathBuf,
-    },
-
-    ProofServerExportUserState {
-        #[arg(long)]
-        logn: usize,
-        #[arg(long)]
-        srs: PathBuf,
-        #[arg(long)]
-        proof_server_state: PathBuf,
-        #[arg(long)]
-        user_id: String,
-        #[arg(long)]
-        out: PathBuf,
-    },
-
-    ProofServerHistory {
-        #[arg(long)]
-        logn: usize,
-        #[arg(long)]
-        srs: PathBuf,
-        #[arg(long)]
-        proof_server_state: PathBuf,
-        #[arg(long)]
-        journal: PathBuf,
-        #[arg(long)]
-        start_block: u64,
-        #[arg(long)]
-        blocks: Vec<u64>,
-        #[arg(long)]
-        user_id: String,
-        #[arg(long)]
-        out: PathBuf,
-    },
-
-    UserVerify {
-        #[arg(long)]
-        logn: usize,
-        #[arg(long)]
-        srs: PathBuf,
-        #[arg(long)]
-        journal: PathBuf,
-        #[arg(long)]
-        user_state: PathBuf,
-        #[arg(long)]
-        history: PathBuf,
-        #[arg(long)]
-        claims: Option<PathBuf>,
-    },
 }
 
 fn main() -> Result<()> {
@@ -293,6 +133,7 @@ fn main() -> Result<()> {
     }
 }
 
+/// Build universe of addresses from dataset blocks
 fn cmd_build_universe(dataset_dir: PathBuf, start_block: u64, end_block: u64, out: PathBuf) -> Result<()> {
     let mut dataset = buvc_rs::DatasetReader::new(&dataset_dir, 100_000);
     let mut addrs = HashSet::<Address>::new();
@@ -312,6 +153,7 @@ fn cmd_build_universe(dataset_dir: PathBuf, start_block: u64, end_block: u64, ou
     Ok(())
 }
 
+/// Create initial publisher snapshot at given block
 fn cmd_publisher_snapshot(
     logn: usize,
     srs: PathBuf,
@@ -360,6 +202,7 @@ fn cmd_publisher_snapshot(
     Ok(())
 }
 
+/// Advance publisher snapshot to new block range
 fn cmd_publisher_advance(
     logn: usize,
     srs: PathBuf,
@@ -433,6 +276,7 @@ fn cmd_publisher_advance(
     Ok(())
 }
 
+/// Issue user state for given addresses at snapshot block
 fn cmd_issue_user_state(
     logn: usize,
     srs: PathBuf,
@@ -482,7 +326,6 @@ fn cmd_issue_user_state(
         v[i] = fr_from_u256_exact(bal)?;
     }
 
-    // Paper-faithful: compute commitment + witness together
    let (gc_rebuilt, gq_alpha) =
     ctx.build_commitment_for_alpha(&v, &alpha_indices);
 
@@ -521,7 +364,7 @@ let alpha_len = alpha_indices.len();
     Ok(())
 }
 
-
+/// Initialize proof server with user states
 fn cmd_proof_server_init(
     logn: usize,
     srs: PathBuf,
@@ -561,6 +404,7 @@ fn cmd_proof_server_init(
     Ok(())
 }
 
+/// Advance proof server to new block
 fn cmd_proof_server_advance(
     logn: usize,
     srs: PathBuf,
@@ -658,6 +502,7 @@ fn cmd_proof_server_advance(
     Ok(())
 }
 
+/// Export user state from proof server
 fn cmd_proof_server_export_user_state(
     logn: usize,
     srs: PathBuf,
@@ -768,14 +613,7 @@ where
     Ok(())
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct ProofServerHistoryOut {
-    pub user_id: String,
-    pub block: u64,
-    pub indices: Vec<usize>,
-    pub witnesses_hex: Vec<String>,
-}
-
+/// Query proof server for user history
 fn cmd_proof_server_history(
     logn: usize,
     srs: PathBuf,
@@ -947,16 +785,8 @@ fn pinned_commitment_at(journal: &Path, srs_id: &str, n: usize, logn: usize, blo
     out.ok_or_else(|| eyre::eyre!("no journal entry for block {}", block))
 }
 
-/* ------------------------------------------------------------- */
-/* External value claims for verification                          */
-/* ------------------------------------------------------------- */
 
-#[derive(Clone, Debug, serde::Deserialize)]
-struct ValueClaim {
-    pub block: u64,
-    pub values_hex: Vec<String>,
-}
-
+/// Verify user state against history and claims
 fn cmd_user_verify(
     logn: usize,
     srs: PathBuf,

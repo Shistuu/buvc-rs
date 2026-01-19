@@ -1,19 +1,16 @@
-// src/dataset_helpers.rs
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::Path;
-
 use ark_bls12_381::fr::Fr;
 use ark_ff::Zero;
+
+use std::{collections::{HashMap, HashSet}, fs, path::Path};
+
 use ethers_core::types::{Address, U256};
+
 use eyre::{bail, Result};
 
-use crate::codec::fr_from_u256_exact;
-use crate::types::DatasetReader;
-use crate::types::StateTracker;
+use crate::{codec::fr_from_u256_exact, types::{DatasetReader, StateTracker}};
 
 impl StateTracker {
-
+    /// Initialize from snapshot values file
     pub fn from_snapshot_vals_file(
         dataset_dir: &Path,
         segment_size: u32,
@@ -72,6 +69,7 @@ impl StateTracker {
         })
     }
 
+    /// Apply changes from next block and return balance deltas
     pub fn apply_next_block(&mut self) -> Result<Vec<(Address, Fr, Fr)>> {
         let b = self.cur_block + 1;
         let entries = self.dataset.get_block(b as u32)?;

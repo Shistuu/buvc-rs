@@ -1,13 +1,8 @@
-// src/proof_server.rs
 use std::collections::HashMap;
 
 use eyre::{bail, Result};
 
 use crate::types::{UserState, ProofServerUser, ProofServerState};
-
-/// Paper-faithful proof-server state:
-/// - maintains witnesses for UNION α across subscribed users
-/// - does NOT store or update values
 
 impl ProofServerState {
     pub fn from_user_states(users: &[(String, UserState)]) -> Result<Self> {

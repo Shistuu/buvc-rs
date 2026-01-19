@@ -1,11 +1,9 @@
-// src/codec.rs
 use ark_bls12_381::{fr::Fr, G1Projective as G1};
 use ark_ff::PrimeField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use ethers_core::{
-    types::{U256},
-    utils::keccak256,
-};
+
+use ethers_core::{types::U256, utils::keccak256};
+
 use eyre::{bail, Result};
 
 pub fn fr_from_hex(hex_str: &str) -> Result<Fr> {

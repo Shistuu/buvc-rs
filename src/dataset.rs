@@ -1,7 +1,4 @@
-// src/dataset.rs
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::{fs::File, io::{Read, Seek, SeekFrom}, path::Path};
 
 use ethers_core::types::{Address, U256};
 use eyre::{bail, Result};
@@ -17,6 +14,7 @@ impl DatasetReader {
         }
     }
 
+    /// Get all entries for a specific block
     pub fn get_block(&mut self, block: u32) -> Result<Vec<Entry>> {
         self.ensure_segment(block)?;
         self.current_segment
@@ -25,6 +23,7 @@ impl DatasetReader {
             .get_block(block)
     }
 
+    /// Iterate over blocks in range, calling f(block, entries)
     pub fn iterate_range<F>(&mut self, start: u32, end: u32, mut f: F) -> Result<()>
     where
         F: FnMut(u32, Vec<Entry>) -> Result<()>,
