@@ -12,3 +12,15 @@ run_*.log
 srs.bin
 snapshot_state_*.json
 universe_*.txt
+
+# experiment outputs
+exp/
+out/
+logs/
+*.bin
+
+# experiment outputs
+exp/
+out/
+logs/
+*.bin

@@ -15,10 +15,11 @@ ethers-providers = { version = "2", features = ["ipc"] }
 ethers-contract = { version = "2", features = ["abigen"] }
 ethers-middleware = { version = "2" }
 
+base64ct = "=1.6.0"
+
 eyre = "0.6"
 color-eyre = "0.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
 rayon = "1.10"
 hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }
