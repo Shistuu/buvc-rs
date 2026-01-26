@@ -120,19 +120,6 @@ pub enum Cmd {
         out: PathBuf,
     },
 
-    ProofServerExportUserState {
-        #[arg(long)]
-        logn: usize,
-        #[arg(long)]
-        srs: PathBuf,
-        #[arg(long)]
-        proof_server_state: PathBuf,
-        #[arg(long)]
-        user_id: String,
-        #[arg(long)]
-        out: PathBuf,
-    },
-
     ProofServerHistory {
         #[arg(long)]
         logn: usize,
@@ -151,14 +138,11 @@ pub enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
-
     UserVerify {
         #[arg(long)]
         logn: usize,
         #[arg(long)]
         srs: PathBuf,
-        #[arg(long)]
-        journal: PathBuf,
         #[arg(long)]
         user_state: PathBuf,
         #[arg(long)]
@@ -166,6 +150,39 @@ pub enum Cmd {
         #[arg(long)]
         claims: Option<PathBuf>,
     },
+    ProofServerHistoryServer {
+        #[arg(long)]
+        logn: usize,
+        #[arg(long)]
+        srs: PathBuf,
+        #[arg(long)]
+        proof_server_state: PathBuf,
+        #[arg(long)]
+        journal: PathBuf,
+        #[arg(long)]
+        r#in: Option<PathBuf>,
+    },
+    ExtractValue {
+    #[arg(long)]
+    dataset_dir: PathBuf,
+
+    #[arg(long)]
+    snapshot: PathBuf,
+
+    #[arg(long)]
+    snapshot_vals: PathBuf,
+
+    #[arg(long)]
+    universe_file: PathBuf,
+
+    #[arg(long)]
+    target_block: u64,
+
+    #[arg(long)]
+    index: usize,
+},
+
+    
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -227,6 +244,7 @@ pub struct ProofServerHistoryOut {
     pub block: u64,
     pub indices: Vec<usize>,
     pub witnesses_hex: Vec<String>,
+    pub gc_hex: String,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -290,6 +308,7 @@ pub enum HistoryOp {
     Update { beta: Vec<usize>, delta: Vec<Fr> },
     Query { query_id: usize },
 }
+
 
 #[derive(Clone, Debug)]
 pub struct HistoryQueryResult {

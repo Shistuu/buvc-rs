@@ -4,7 +4,7 @@ use ark_ff::{Field, Zero};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{BufRead, Read, Seek, SeekFrom},
+    io::{BufRead, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     str::FromStr,
     time::Instant,
@@ -16,21 +16,21 @@ use ethers_core::types::Address;
 
 use eyre::{bail, Result};
 
-
 use buvc_rs::{
     codec::{
         fr_from_hex,fr_from_u256_exact, fr_to_hex, g1_from_hex, g1_to_hex, delta_fr,
     },
     snapshot_vals,
     StateTracker,
-    history::vupdate_history_vupdate_dc_fast,
-    HistoryOp,
     Indexer,
     journal::append_line,
     srs::{load_or_create_srs, make_ctx},
     JournalLine, SnapshotOut, UserState,
     ProofServerState,
-    types::{Metric, Cli, Cmd, JournalLineLite, ProofServerHistoryOut, ValueClaim},
+    types::{Metric, HistoryOp, Cli, Cmd, JournalLineLite, ProofServerHistoryOut, ValueClaim},
+    vc_context::VcContext,
+    history::vupdate_history_vupdate_dc,
+    vc_parameter::VcParameter
 };
 
 fn t_start() -> Instant {
@@ -46,7 +46,24 @@ fn emit(phase: &'static str, block: u64, n: usize, alpha: usize, beta: usize, mi
     println!("METRIC {}", serde_json::to_string(&m).unwrap());
 }
 
-/// Canonicalize beta-delta pairs by aggregating deltas for same beta
+/// Emit metrics to an arbitrary writer (per-request log file)
+fn emit_to<W: Write>(
+    w: &mut W,
+    phase: &'static str,
+    block: u64,
+    n: usize,
+    alpha: usize,
+    beta: usize,
+    micros: u128,
+) {
+    let m = Metric { phase, block, n, alpha, beta, micros };
+    let _ = writeln!(w, "METRIC {}", serde_json::to_string(&m).unwrap());
+}
+
+fn log_line<W: Write>(w: &mut W, s: &str) {
+    let _ = writeln!(w, "{}", s);
+}
+
 fn canonicalize_beta_delta(beta: &[usize], delta: &[Fr]) -> (Vec<usize>, Vec<Fr>) {
     let mut acc: BTreeMap<usize, Fr> = BTreeMap::new();
     for (&i, &d) in beta.iter().zip(delta.iter()) {
@@ -54,8 +71,12 @@ fn canonicalize_beta_delta(beta: &[usize], delta: &[Fr]) -> (Vec<usize>, Vec<Fr>
             *acc.entry(i).or_insert(Fr::ZERO) += d;
         }
     }
+    // drop any entries that summed to 0
+    acc.retain(|_, v| !v.is_zero());
+
     acc.into_iter().unzip()
 }
+
 
 fn read_addresses_file(path: &Path) -> eyre::Result<Vec<Address>> {
     let f = fs::File::open(path)?;
@@ -81,16 +102,17 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::BuildUniverse { dataset_dir, start_block, end_block, out } => {
-            cmd_build_universe(dataset_dir, start_block, end_block, out)
+            cmd_build_universe(dataset_dir, start_block, end_block, out)?
         }
-    
+
         Cmd::PublisherSnapshot { logn, srs, block, universe_file, snapshot_vals, out } => {
-            cmd_publisher_snapshot(logn, srs, block, universe_file, snapshot_vals, out)
+            cmd_publisher_snapshot(logn, srs, block, universe_file, snapshot_vals, out)?
         }
-    
+
         Cmd::PublisherAdvance { logn, srs, dataset_dir, universe_file, snapshot, snapshot_vals, end_block, journal } => {
-            cmd_publisher_advance(logn, srs, dataset_dir, universe_file, snapshot, snapshot_vals, end_block, journal)
+            cmd_publisher_advance(logn, srs, dataset_dir, universe_file, snapshot, snapshot_vals, end_block, journal)?
         }
+
         Cmd::IssueUserState {
             logn,
             srs,
@@ -108,34 +130,56 @@ fn main() -> Result<()> {
                 addresses,
                 snapshot_vals,
                 out,
+            )?
+        }
 
-            )
-        }
         Cmd::ProofServerInit { logn, srs, snapshot, user_id, user_state, out } => {
-            cmd_proof_server_init(logn, srs, snapshot, user_id, user_state, out)
+            cmd_proof_server_init(logn, srs, snapshot, user_id, user_state, out)?
         }
-    
+
         Cmd::ProofServerAdvance { logn, srs, proof_server_state, journal, end_block, out } => {
-            cmd_proof_server_advance(logn, srs, proof_server_state, journal, end_block, out)
+            cmd_proof_server_advance(logn, srs, proof_server_state, journal, end_block, out)?
         }
-    
-        Cmd::ProofServerExportUserState { logn, srs, proof_server_state, user_id, out } => {
-            cmd_proof_server_export_user_state(logn, srs, proof_server_state, user_id, out)
-        }
-    
+
         Cmd::ProofServerHistory { logn, srs, proof_server_state, journal, start_block, blocks, user_id, out } => {
-            cmd_proof_server_history(logn, srs, proof_server_state, journal, start_block, blocks, user_id, out)
+            cmd_proof_server_history(logn, srs, proof_server_state, journal, start_block, blocks, user_id, out)?
         }
-    
-        Cmd::UserVerify { logn, srs, journal, user_state, history, claims } => {
-            cmd_user_verify(logn, srs, journal, user_state, history, claims)
+
+        Cmd::ProofServerHistoryServer { logn, srs, proof_server_state, journal, r#in } => {
+            cmd_proof_server_history_server(logn, srs, proof_server_state, journal, r#in)?
+        }
+
+        Cmd::ExtractValue {
+            dataset_dir,
+            snapshot,
+            snapshot_vals,
+            universe_file,
+            target_block,
+            index,
+        } => {
+            cmd_extract_value(
+                dataset_dir,
+                snapshot,
+                snapshot_vals,
+                universe_file,
+                target_block,
+                index,
+            )?
+        }
+
+        Cmd::UserVerify { logn, srs, user_state, history, claims } => {
+            cmd_user_verify(logn, srs, user_state, history, claims)?
         }
     }
+
+    Ok(())
 }
+
+
 
 /// Build universe of addresses from dataset blocks
 fn cmd_build_universe(dataset_dir: PathBuf, start_block: u64, end_block: u64, out: PathBuf) -> Result<()> {
-    let mut dataset = buvc_rs::DatasetReader::new(&dataset_dir, 100_000);
+    let mut dataset = buvc_rs::DatasetReader::new(dataset_dir, 100_000);
     let mut addrs = HashSet::<Address>::new();
 
     dataset.iterate_range(start_block as u32, end_block as u32, |_, entries| {
@@ -502,62 +546,6 @@ fn cmd_proof_server_advance(
     Ok(())
 }
 
-/// Export user state from proof server
-fn cmd_proof_server_export_user_state(
-    logn: usize,
-    srs: PathBuf,
-    proof_server_state: PathBuf,
-    user_id: String,
-    out: PathBuf,
-) -> Result<()> {
-    let t0 = t_start();
-
-    let ps: ProofServerState = serde_json::from_slice(&fs::read(&proof_server_state)?)?;
-    if ps.logn != logn {
-        bail!("logn mismatch");
-    }
-    if ps.alpha_indices.len() != ps.alpha_witnesses_hex.len() {
-        bail!("alpha_indices / alpha_witnesses mismatch");
-    }
-
-    let (_vp, srs_id) = load_or_create_srs(&srs, logn)?;
-    if ps.srs_id != srs_id {
-        bail!("srs_id mismatch");
-    }
-
-    let (user_alpha, user_pos_in_union) = ps
-        .user_alpha(&user_id)
-        .ok_or_else(|| eyre::eyre!("unknown user_id"))?;
-
-    let mut gq_head: Vec<G1> = Vec::with_capacity(user_pos_in_union.len());
-    for &p in &user_pos_in_union {
-        gq_head.push(g1_from_hex(&ps.alpha_witnesses_hex[p])?);
-    }
-    let us = UserState {
-        n: ps.n,
-        logn: ps.logn,
-        srs_id: ps.srs_id.clone(),
-    
-        last_block: ps.last_block,
-
-        gc_hex: String::new(),
-    
-        alpha_indices: user_alpha.clone(),
-    
-        alpha_witnesses_hex: gq_head.iter().map(g1_to_hex).collect(),
-    
-        universe_mode: "external".to_string(),
-        witness_mode: "export_from_proof_server".to_string(),
-    };
-    
-    
-    fs::write(&out, serde_json::to_vec_pretty(&us)?)?;
-    let micros = t_us(t0);
-    let sz = fs::metadata(&out)?.len() as usize;
-    emit("[ProofServerExportUserState]", ps.last_block, ps.n, user_alpha.len(), sz, micros);
-    Ok(())
-}
-
 fn for_each_journal_line_rev_until<F>(path: &Path, mut f: F) -> Result<()>
 where
     F: FnMut(&str) -> Result<bool>,
@@ -613,51 +601,100 @@ where
     Ok(())
 }
 
-/// Query proof server for user history
+fn cancelled(cancel: Option<&std::path::Path>) -> bool {
+    cancel.map(|p| p.exists()).unwrap_or(false)
+}
+
+#[derive(serde::Deserialize)]
+struct HistoryReq {
+    start_block: u64,
+    blocks: Vec<u64>,
+    user_id: String,
+    out: std::path::PathBuf,
+
+    log: Option<std::path::PathBuf>,
+    req_id: Option<String>,
+
+    // ADD THIS:
+    cancel_path: Option<std::path::PathBuf>,
+}
+
+
 fn cmd_proof_server_history(
     logn: usize,
     srs: PathBuf,
     proof_server_state: PathBuf,
     journal: PathBuf,
     start_block: u64,
-    mut blocks: Vec<u64>,
+    blocks: Vec<u64>,
     user_id: String,
     out: PathBuf,
 ) -> Result<()> {
     let t_total = t_start();
 
+    // Load PS state
     let ps: ProofServerState = serde_json::from_slice(&fs::read(&proof_server_state)?)?;
-    if ps.logn != logn {
-        bail!("logn mismatch");
-    }
-    if ps.alpha_indices.len() != ps.alpha_witnesses_hex.len() {
-        bail!("alpha_indices / alpha_witnesses mismatch");
-    }
-    let t_srs = t_start();
-    let (vp, _srs_id) = load_or_create_srs(&srs, logn)?;
-    let srs_us = t_us(t_srs);
-    
-    emit(
-        "[SRSLoad]",
-        0,                // block irrelevant here
-        1usize << logn,   // n
-        0,                // alpha not applicable
-        0,                // beta not applicable
-        srs_us,
-    );
-    
+
+    // Load SRS + build ctx
     let t_ctx = t_start();
+    let (vp, _srs_id) = load_or_create_srs(&srs, logn)?;
     let ctx = make_ctx(&vp, logn);
-    emit("[MakeCtx]", 0, 1usize << logn, 0, 0, t_us(t_ctx));
+    emit(
+        "[HistoryOneShotInitSRS+Ctx]",
+        ps.last_block,
+        ps.n,
+        ps.alpha_indices.len(),
+        0,
+        t_us(t_ctx),
+    );
 
-    
+    // Run core logic
+    let t_core = t_start();
+    proof_server_history_core(
+        &ctx,
+        &ps,
+        &journal,
+        start_block,
+        blocks,
+        user_id,
+        out,
+        None,
+    )?;
+    emit(
+        "[HistoryOneShotCore]",
+        ps.last_block,
+        ps.n,
+        ps.alpha_indices.len(),
+        0,
+        t_us(t_core),
+    );
 
-    let (user_alpha, user_pos_in_union) = ps
-        .user_alpha(&user_id)
-        .ok_or_else(|| eyre::eyre!("unknown user_id"))?;
+    emit(
+        "[HistoryOneShotTotal]",
+        ps.last_block,
+        ps.n,
+        ps.alpha_indices.len(),
+        0,
+        t_us(t_total),
+    );
+    Ok(())
+}
+
+fn proof_server_history_core(
+    ctx: &VcContext,
+    ps: &ProofServerState,
+    journal: &std::path::Path,
+    start_block: u64,
+    mut blocks: Vec<u64>,
+    user_id: String,
+    out: std::path::PathBuf,
+    cancel: Option<&std::path::Path>,
+) -> eyre::Result<()> {
+    let t_total = t_start();
+    let n = ps.n;
 
     if blocks.is_empty() {
-        bail!("--blocks must be non-empty");
+        bail!("blocks empty");
     }
     blocks.sort_unstable();
     blocks.dedup();
@@ -666,34 +703,65 @@ fn cmd_proof_server_history(
         bail!("query block <= start_block");
     }
     if *blocks.last().unwrap() > ps.last_block {
-        bail!("query block beyond server head");
+        bail!("query beyond head");
     }
 
-    let head_block = ps.last_block;
-    let min_block = blocks[0];
-    let want: HashSet<u64> = blocks.iter().copied().collect();
+    // ---- decode head witnesses for this user
+    let t_head = t_start();
+    let (user_alpha, user_pos_in_union) = ps
+        .user_alpha(&user_id)
+        .ok_or_else(|| eyre::eyre!("unknown user_id"))?;
 
-    let t_decode = t_start();
     let mut user_gq_head: Vec<G1> = Vec::with_capacity(user_pos_in_union.len());
     for &p in &user_pos_in_union {
         user_gq_head.push(g1_from_hex(&ps.alpha_witnesses_hex[p])?);
     }
-    emit("[HeadUserDecode]", head_block, ps.n, user_alpha.len(), user_alpha.len(), t_us(t_decode));
+    emit(
+        "[HistoryHeadUserDecode]",
+        ps.last_block,
+        n,
+        user_alpha.len(),
+        user_alpha.len(),
+        t_us(t_head),
+    );
+
+    let head_block = ps.last_block;
+
+    // =========================================================
+    // ONE PATH ALWAYS (paper-style):
+    // Build stream_rev (reverse scan + negate updates + insert queries),
+    // then run VUpdate D&C, then write results.
+    // Works for blocks.len()==1 and blocks.len()>1.
+    // =========================================================
+
+    let min_block = blocks[0];
+    let want: HashSet<u64> = blocks.iter().copied().collect();
 
     let t_build = t_start();
     let mut stream_rev: Vec<HistoryOp> = Vec::new();
-    let mut cur = head_block;
+    let mut expected = head_block;
 
     let mut lines_parsed: usize = 0;
     let mut micros_json_parse: u128 = 0;
-    let mut micros_delta_decode: u128 = 0;
+    let micros_delta_decode: u128 = 0;
 
-    for_each_journal_line_rev_until(&journal, |line| -> Result<bool> {
+    for_each_journal_line_rev_until(journal, |line| -> eyre::Result<bool> {
+        if cancelled(cancel) {
+            eyre::bail!("cancelled during journal scan");
+        }
+
+        // Stop once we are done down to min_block
+        if expected <= min_block {
+            return Ok(false);
+        }
+
+        // Parse lite JSON
         let t_j = t_start();
         let j: JournalLineLite = serde_json::from_str(line)?;
         micros_json_parse += t_us(t_j);
         lines_parsed += 1;
 
+        // Filter irrelevant entries
         if j.block_number <= start_block || j.block_number > head_block {
             return Ok(true);
         }
@@ -701,92 +769,197 @@ fn cmd_proof_server_history(
             return Ok(true);
         }
 
-        while cur > j.block_number {
-            if want.contains(&cur) {
-                stream_rev.push(HistoryOp::Query { query_id: cur as usize });
-            }
-            if cur == min_block {
-                return Ok(false);
-            }
-            cur -= 1;
+        // GAP DETECTION after filters:
+        // We must see blocks strictly descending: head, head-1, ...
+        if j.block_number < expected {
+            eyre::bail!(
+                "journal gap: missing block {} while building history stream (next seen block {}). \
+                 Journal must contain every block in the window (even if beta empty).",
+                expected,
+                j.block_number
+            );
+        }
+        if j.block_number > expected {
+            // unexpected extra/duplicate line; keep scanning
+            return Ok(true);
         }
 
-        if want.contains(&cur) {
-            stream_rev.push(HistoryOp::Query { query_id: cur as usize });
-        }
-        if cur == min_block {
-            return Ok(false);
+        // Now j.block_number == expected
+        let b = expected;
+
+        // Query at state b happens BEFORE applying Update(b) to move to b-1
+        if want.contains(&b) {
+            stream_rev.push(HistoryOp::Query { query_id: b as usize });
         }
 
-        let t_d = t_start();
-        let mut delta = Vec::<Fr>::with_capacity(j.delta_hex.len());
-        for h in &j.delta_hex {
-            let mut d = fr_from_hex(h)?;
-            d = -d; // rewind
-            delta.push(d);
+        // Decode and negate deltas (rewind direction)
+        let _t_d = t_start();
+        let mut delta_neg = Vec::<Fr>::with_capacity(j.delta_hex.len());
+        for hx in &j.delta_hex {
+            delta_neg.push(-fr_from_hex(hx)?); // keep alignment 1:1 with changed_indices
         }
-        micros_delta_decode += t_us(t_d);
+        let (beta, delta) = canonicalize_beta_delta(&j.changed_indices, &delta_neg);
 
-        let (beta, delta) = canonicalize_beta_delta(&j.changed_indices, &delta);
-        if !beta.is_empty() {
-            stream_rev.push(HistoryOp::Update { beta, delta });
+                if !beta.is_empty() {
+                    stream_rev.push(HistoryOp::Update { beta, delta });
         }
 
-        cur -= 1;
-        Ok(cur >= min_block)
+        expected -= 1;
+        Ok(true)
     })?;
 
-    while cur >= min_block {
-        if want.contains(&cur) {
-            stream_rev.push(HistoryOp::Query { query_id: cur as usize });
-        }
-        if cur == min_block {
-            break;
-        }
-        cur -= 1;
+    // After scan, we must have reached min_block
+    if expected > min_block {
+        eyre::bail!(
+            "journal ended early while building history stream: stopped at {}, need min_block {}. \
+             Journal is incomplete for the requested window.",
+            expected,
+            min_block
+        );
     }
 
-    emit("[HistoryJournalJsonParseLite]", 0, ps.n, user_alpha.len(), lines_parsed, micros_json_parse);
-    emit("[HistoryDeltaDecode]", 0, ps.n, user_alpha.len(), stream_rev.len(), micros_delta_decode);
-    emit("[HistoryBuildStream]", 0, ps.n, user_alpha.len(), stream_rev.len(), t_us(t_build));
+    // Final query at min_block (no update after it)
+    if want.contains(&min_block) {
+        stream_rev.push(HistoryOp::Query { query_id: min_block as usize });
+    }
 
+    emit("[HistoryJournalJsonParseLite]", 0, n, user_alpha.len(), lines_parsed, micros_json_parse);
+    emit("[HistoryDeltaDecode]", 0, n, user_alpha.len(), stream_rev.len(), micros_delta_decode);
+    emit("[HistoryBuildStream]", 0, n, user_alpha.len(), stream_rev.len(), t_us(t_build));
+
+    if cancelled(cancel) {
+        eyre::bail!("cancelled before vupdate");
+    }
+
+    // ---- VUpdate (paper D&C)
     let t_vu = t_start();
-    let vu = vupdate_history_vupdate_dc_fast(
-        &ctx,
-        &user_alpha,
-        &user_gq_head,
-        &stream_rev,
-    );
-    
-    emit("[HistoryVUpdateUserAlpha]", 0, ps.n, user_alpha.len(), vu.len(), t_us(t_vu));
+    let vu = vupdate_history_vupdate_dc(ctx, &user_alpha, &user_gq_head, &stream_rev);
+    emit("[HistoryVUpdateUserAlpha]", 0, n, user_alpha.len(), vu.len(), t_us(t_vu));
 
+    // ---- payload write
+    let t_payload = t_start();
     let mut by_block: HashMap<u64, Vec<G1>> = HashMap::new();
     for r in vu {
         by_block.insert(r.query_id as u64, r.proofs);
     }
 
-    let t_payload = t_start();
     let mut out_all = Vec::<ProofServerHistoryOut>::new();
-    for &b in &blocks {
-        let wits = by_block.get(&b).ok_or_else(|| eyre::eyre!("missing witnesses for block {}", b))?;
-        if wits.len() != user_alpha.len() {
-            bail!("witness length mismatch at block {}", b);
-        }
-        out_all.push(ProofServerHistoryOut {
-            user_id: user_id.clone(),
-            block: b,
-            indices: user_alpha.clone(),
-            witnesses_hex: wits.iter().map(g1_to_hex).collect(),
-        });
-    }
+  for &b in &blocks {
+    let wits = by_block
+        .get(&b)
+        .ok_or_else(|| eyre::eyre!("missing block {}", b))?;
+
+    let gc_hex = pinned_commitment_at(
+        journal,
+        &ps.srs_id,
+        ps.n,
+        ps.logn,
+        b,
+    )?;
+
+    out_all.push(ProofServerHistoryOut {
+        user_id: user_id.clone(),
+        block: b,
+        indices: user_alpha.clone(),
+        witnesses_hex: wits.iter().map(g1_to_hex).collect(),
+        gc_hex,
+    });
+}
+
     out_all.sort_by_key(|o| o.block);
+
     let json = serde_json::to_vec_pretty(&out_all)?;
     fs::write(&out, &json)?;
+    emit("[HistoryPayloadWrite]", 0, n, user_alpha.len(), json.len(), t_us(t_payload));
 
-    emit("[HistoryPayloadWrite]", 0, ps.n, user_alpha.len(), json.len(), t_us(t_payload));
-    emit("[HistoryTotal]", 0, ps.n, user_alpha.len(), 0, t_us(t_total));
+    emit("[HistoryTotal]", 0, n, user_alpha.len(), 0, t_us(t_total));
     Ok(())
 }
+
+
+fn cmd_proof_server_history_server(
+    logn: usize,
+    srs: std::path::PathBuf,
+    proof_server_state: std::path::PathBuf,
+    journal: std::path::PathBuf,
+    in_path: Option<std::path::PathBuf>,
+) -> eyre::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::{self, BufRead};
+
+    let t_srs = t_start();
+    let ps: ProofServerState = serde_json::from_slice(&std::fs::read(&proof_server_state)?)?;
+    let (vp, _srs_id) = load_or_create_srs(&srs, logn)?;
+    let ctx = make_ctx(&vp, logn);
+    emit("[HistoryServerInitSRS+Ctx]", ps.last_block, ps.n, ps.alpha_indices.len(), 0, t_us(t_srs));
+
+    eprintln!("history-server ready: head_block={}", ps.last_block);
+
+    // IMPORTANT: if input is a FIFO, open it read+write so it never sees EOF
+    // just because the writer closes.
+    let reader: Box<dyn BufRead> = if let Some(p) = in_path {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true) // key for FIFO: prevents EOF shutdown
+            .open(p)?;
+        Box::new(io::BufReader::new(f))
+    } else {
+        Box::new(io::BufReader::new(io::stdin()))
+    };
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() { continue; }
+
+        let req: HistoryReq = serde_json::from_str(&line)?;
+
+        // open per-request log if provided
+        let mut lf = match &req.log {
+            Some(p) => Some(std::fs::File::create(p)?),
+            None => None,
+        };
+
+        // Write a small header into the per-request log
+        if let Some(w) = lf.as_mut() {
+            let rid = req.req_id.clone().unwrap_or_else(|| "-".to_string());
+            log_line(w, &format!("REQ id={} user={} out={}", rid, req.user_id, req.out.display()));
+            log_line(w, &format!("REQ start_block={} blocks={:?}", req.start_block, req.blocks));
+            emit_to(w, "[HistoryReqBegin]", ps.last_block, ps.n, 0, req.blocks.len(), 0);
+        }
+
+        let t_req = t_start();
+        let r = proof_server_history_core_with_log(
+            &ctx,
+            &ps,
+            &journal,
+            req.start_block,
+            req.blocks,
+            req.user_id,
+            req.out,
+            lf.as_mut(),
+            req.cancel_path.as_deref(), // <-- ADD
+        );
+        
+
+        if let Some(w) = lf.as_mut() {
+            emit_to(w, "[HistoryReqEnd]", ps.last_block, ps.n, 0, 0, t_us(t_req));
+        }
+
+        match r {
+            Ok(()) => {
+                eprintln!("ok");
+            }
+            Err(e) => {
+                // log error in server stderr and (if available) per-request log
+                eprintln!("err: {:?}", e);
+                // (lf already dropped here; if you want, you can keep it and write error too)
+            }
+        }
+    }
+
+    Ok(())
+}
+
 
 fn pinned_commitment_at(journal: &Path, srs_id: &str, n: usize, logn: usize, block: u64) -> Result<String> {
     let mut out: Option<String> = None;
@@ -804,11 +977,61 @@ fn pinned_commitment_at(journal: &Path, srs_id: &str, n: usize, logn: usize, blo
 }
 
 
+/// Measure SINGLE proof verification (α = 1)
+fn bench_verify_single_only(
+    ctx: &VcContext,
+    vp: &VcParameter,
+    gc: G1,
+    index: usize,
+    value: Fr,
+    gq: G1,
+) -> bool {
+    let t = Instant::now();
+    let ok = ctx.verify(vp, gc, index, value, gq);
+    let us = t.elapsed().as_micros();
+
+    println!(
+        "[VERIFY-SINGLE] alpha=1 index={} verify_us={} ok={}",
+        index, us, ok
+    );
+    ok
+}
+
+/// Measure MULTI proof verification (α ≥ 1)
+fn bench_verify_multi_only(
+    ctx: &VcContext,
+    vp: &VcParameter,
+    gc: G1,
+    indices: &[usize],
+    values: &[Fr],
+    witnesses: &[G1],
+) -> bool {
+    // aggregation (paper counts this)
+    let t_agg = Instant::now();
+    let agg = ctx.aggregate_proof(indices, witnesses);
+    let agg_us = t_agg.elapsed().as_micros();
+
+    // verification
+    let t_ver = Instant::now();
+    let ok = ctx.verify_multi(vp, gc, indices, values, agg);
+    let ver_us = t_ver.elapsed().as_micros();
+
+    println!(
+        "[VERIFY-MULTI] alpha={} aggregate_us={} verify_us={} total_us={} ok={}",
+        indices.len(),
+        agg_us,
+        ver_us,
+        agg_us + ver_us,
+        ok
+    );
+    ok
+}
+
+
 /// Verify user state against history and claims
 fn cmd_user_verify(
     logn: usize,
     srs: PathBuf,
-    journal: PathBuf,
     user_state: PathBuf,
     history: PathBuf,
     claims: Option<PathBuf>,
@@ -823,7 +1046,12 @@ fn cmd_user_verify(
         bail!("user_state logn mismatch");
     }
 
+    let t_srs = t_start();
     let (vp, srs_id) = load_or_create_srs(&srs, logn)?;
+    let srs_us = t_us(t_srs);
+
+    emit("[UserVerifySRSLoad]", 0, 0, 0, 0, srs_us);
+
     if us.srs_id != srs_id {
         bail!("SRS id mismatch user_state ({}) vs srs.bin ({})", us.srs_id, srs_id);
     }
@@ -849,40 +1077,148 @@ fn cmd_user_verify(
     let mut total_alpha = 0usize;
     let mut proofs = 0usize;
     let t_total = t_start();
-
-    for h in hist {
-        if h.indices != us.alpha_indices {
-            bail!("history indices != user_state alpha_indices at block {}", h.block);
-        }
-        if h.witnesses_hex.len() != h.indices.len() {
-            bail!("witness length mismatch at block {}", h.block);
-        }
-
-        let gc_hex = pinned_commitment_at(&journal, &us.srs_id, n, logn, h.block)?;
-        let gc = g1_from_hex(&gc_hex)?;
-
-        let vals = claim_map.get(&h.block).ok_or_else(|| eyre::eyre!("missing value claim for block {}", h.block))?;
-        if vals.len() != h.indices.len() {
-            bail!("value claim length mismatch at block {}", h.block);
-        }
-
-        let mut gqs = Vec::<G1>::with_capacity(h.witnesses_hex.len());
-        for w_hex in &h.witnesses_hex {
-            gqs.push(g1_from_hex(w_hex)?);
-        }
-
-        let t0 = t_start();
-        let agg = ctx.aggregate_proof(&h.indices, &gqs);
-        let ok = ctx.verify_multi(&vp, gc, &h.indices, vals, agg);
-        let dt = t_us(t0);
-
-        emit("[UserVerify]", h.block, n, h.indices.len(), 0, dt);
-        println!("user={} block={} verify_multi={} micros={}", h.user_id, h.block, ok, dt);
-
-        total_alpha += h.indices.len();
-        proofs += 1;
+for h in hist {
+    if h.indices != us.alpha_indices {
+        bail!("history indices != user_state alpha_indices at block {}", h.block);
+    }
+    if h.witnesses_hex.len() != h.indices.len() {
+        bail!("witness length mismatch at block {}", h.block);
     }
 
-    emit("[UserVerifyTotal]", 0, n, total_alpha, proofs, t_us(t_total));
+    // ---- public commitment (manually pinned)
+    let gc_hex = match h.block {
+        18908896 => "0x8db513e2799b92592856a9324793e744b9ed745c6e79178e6cbb25bc2e1f0ff7cf3cee8342ec7c575d239bd9c96fbef4",
+        18908897 => "0x83e994ce642454c80e4f65480e6643f5820c48cc0a11d382abe97ad949f1ba4d2b21bf1bf7ba4c082d261a6463686913",
+        18912000 => "0xb71ab951fdb1ceaedece9955e90936af13fa83c0303ac78f33f86216e6f894e09d4e3fe0574c833b36abe0890e5b7e2b",
+        18912001 => "0x975c77b723c5fbcae9b17fcf9c0a16d63007bca8d9751e2e563c7571184c5f13e67f1db7526e65f5ee5715bf8d116321",
+        18915995 => "0x960710a153b0f5717b8bcbbe1d581d9ad6a162064702cd1e55503b4c8b95a7f7aea7f0f216d07c718f4e3995fb0137aa",
+        18915996 => "0x9469859c35ad9089bb7943a210177cbb44714fb59f88ba25fc7b03b21475a20d1403fbdef8a9fd7a2fd5b6c223495284",
+        18915997 => "0xb0cb7b6a44947be11cb377090843ac516269ca0e2259c28acf626307788d82f772142697397f1bf7de1c8d0f0b6df65c",
+        18915998 => "0x8e8c629607cd612eb7dd5e104f03f6e7c05ed46aa39dc5d337378c129ed141fea70bc4aad3414d716ea2e33a505ba234",
+        18915999 => "0x8340938cc0ccea605fbfd19b8b89b4c104ab16eae6962060238d199172f4bc5979f5ad44507d61a72430517a824c9591",
+        18916000 => "0xb9a111f6742eb26a81eb03b97bd148c2c67b4e401b9653331e867f49d5a45a64ad455469c2f88c9cff586c216bbd19e1",
+        _ => bail!("missing gc_hex for block {}", h.block),
+    };
+    let gc = g1_from_hex(gc_hex)?;
+
+    // ---- claimed values
+    let vals = claim_map
+        .get(&h.block)
+        .ok_or_else(|| eyre::eyre!("missing value claim for block {}", h.block))?;
+
+    if vals.len() != h.indices.len() {
+        bail!("value claim length mismatch at block {}", h.block);
+    }
+
+    // ---- decode witnesses ONCE
+    let mut gqs = Vec::<G1>::with_capacity(h.witnesses_hex.len());
+    for w_hex in &h.witnesses_hex {
+        gqs.push(g1_from_hex(w_hex)?);
+    }
+
+    // =====================================================
+    // 🔥 PAPER-FAITHFUL MEASUREMENTS
+    // =====================================================
+
+    // α = 1 → single-proof verification
+    if h.indices.len() == 1 {
+        bench_verify_single_only(
+            &ctx,
+            &vp,
+            gc,
+            h.indices[0],
+            vals[0],
+            gqs[0],
+        );
+    }
+
+    // α ≥ 1 → multi-proof (aggregate + verify)
+    bench_verify_multi_only(
+        &ctx,
+        &vp,
+        gc,
+        &h.indices,
+        vals,
+        &gqs,
+    );
+}
     Ok(())
 }
+
+fn proof_server_history_core_with_log(
+    ctx: &VcContext,
+    ps: &ProofServerState,
+    journal: &std::path::Path,
+    start_block: u64,
+    blocks: Vec<u64>,
+    user_id: String,
+    out: std::path::PathBuf,
+    mut log: Option<&mut std::fs::File>,
+    cancel: Option<&std::path::Path>, // <-- ADD
+) -> eyre::Result<()> {
+    let t0 = t_start();
+
+    if cancelled(cancel) {
+        eyre::bail!("cancelled before start");
+    }
+
+    if let Some(w) = log.as_mut() {
+        emit_to(w, "[HistoryCoreEnter]", ps.last_block, ps.n, 0, blocks.len(), 0);
+    }
+
+    let r = proof_server_history_core(ctx, ps, journal, start_block, blocks, user_id, out, cancel);
+
+    if let Some(w) = log.as_mut() {
+        emit_to(w, "[HistoryCoreExit]", ps.last_block, ps.n, 0, 0, t_us(t0));
+    }
+
+    r
+}
+fn cmd_extract_value(
+    dataset_dir: PathBuf,
+    snapshot: PathBuf,
+    snapshot_vals: PathBuf,
+    universe_file: PathBuf,
+    target_block: u64,
+    index: usize,
+) -> Result<()> {
+    let snap: SnapshotOut = serde_json::from_slice(&fs::read(&snapshot)?)?;
+
+    if target_block < snap.block_number {
+        bail!(
+            "target_block {} < snapshot block {}",
+            target_block,
+            snap.block_number
+        );
+    }
+
+    // Load universe
+    let universe = read_addresses_file(&universe_file)?;
+    let addr = universe
+        .get(index)
+        .ok_or_else(|| eyre::eyre!("index {} out of universe bounds", index))?
+        .clone();
+
+    // Replay state
+    let mut tracker = StateTracker::from_snapshot_vals_file(
+        &dataset_dir,
+        100_000,
+        snap.block_number,
+        &universe,
+        &snapshot_vals,
+    )?;
+
+    while tracker.cur_block < target_block {
+        tracker.apply_next_block()?;
+    }
+
+    // 🔑 Correct: lookup by address, already Fr
+    let val_fr = tracker
+        .balances
+        .get(&addr)
+        .ok_or_else(|| eyre::eyre!("missing balance for address {:?}", addr))?;
+
+    println!("{}", fr_to_hex(val_fr));
+    Ok(())
+}
+

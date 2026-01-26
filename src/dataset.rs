@@ -75,6 +75,12 @@ impl DatasetReader {
 
 impl SegmentReader {
     fn open<P: AsRef<Path>>(dir: P, base: u32, end: u32) -> Result<Self> {
+          eprintln!(
+        "Opening segment: {}/blk_{}_{}.*",
+        dir.as_ref().display(),
+        base,
+        end
+    );
         let dat_path = dir.as_ref().join(segment_name(base, end, "dat"));
         let idx_path = dir.as_ref().join(segment_name(base, end, "idx"));
 
