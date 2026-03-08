@@ -71,6 +71,14 @@ pub enum Cmd {
         end_block: u64,
         #[arg(long)]
         journal: PathBuf,
+        #[arg(long)]
+        alpha_addresses: Option<PathBuf>,
+        #[arg(long)]
+        proof_server_out: Option<PathBuf>,
+        #[arg(long)]
+        block_log_csv: Option<PathBuf>,
+        #[arg(long)]
+        cancel_path: Option<PathBuf>
     },
     IssueUserState {
         #[arg(long)]
@@ -181,7 +189,16 @@ pub enum Cmd {
     #[arg(long)]
     index: usize,
 },
+Daemon {
+    #[arg(long)]
+    logn: usize,
+    #[arg(long)]
+    srs: PathBuf,
 
+    /// Optional FIFO path; if omitted, daemon reads stdin.
+    #[arg(long)]
+    r#in: Option<PathBuf>,
+},
     
 }
 
@@ -243,6 +260,7 @@ pub struct ProofServerHistoryOut {
     pub user_id: String,
     pub block: u64,
     pub indices: Vec<usize>,
+    pub values_hex: Vec<String>,
     pub witnesses_hex: Vec<String>,
     pub gc_hex: String,
 }

@@ -9,6 +9,7 @@ use std::{
     str::FromStr,
     time::Instant,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 
@@ -32,6 +33,59 @@ use buvc_rs::{
     history::vupdate_history_vupdate_dc,
     vc_parameter::VcParameter
 };
+use std::sync::OnceLock;
+
+struct LoadedCtx {
+    logn: usize,
+    srs_path: PathBuf,
+    vp: VcParameter,
+    srs_id: String,
+    ctx: VcContext,
+}
+
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+}
+
+static LOADED: OnceLock<LoadedCtx> = OnceLock::new();
+
+fn get_loaded_ctx(logn: usize, srs: &Path) -> Result<&'static LoadedCtx> {
+    if let Some(lc) = LOADED.get() {
+        // Enforce: same srs + same logn inside one daemon lifetime
+        if lc.logn != logn {
+            bail!("Loaded ctx logn={} but requested logn={}", lc.logn, logn);
+        }
+        if lc.srs_path.as_path() != srs {
+            bail!(
+                "Loaded ctx srs_path={:?} but requested srs_path={:?}",
+                lc.srs_path,
+                srs
+            );
+        }
+        return Ok(lc);
+    }
+
+    // First time in this process: load + build ctx once
+    let t0 = t_start();
+    let (vp, srs_id) = load_or_create_srs(srs, logn)?;
+    let ctx = make_ctx(&vp, logn);
+    let _ = LOADED.set(LoadedCtx {
+        logn,
+        srs_path: srs.to_path_buf(),
+        vp,
+        srs_id,
+        ctx,
+    });
+
+    let n = 1usize << logn;
+    emit("[InitSRS+CtxOnce]", 0, n, 0, 0, t_us(t0));
+
+    Ok(LOADED.get().unwrap())
+}
 
 fn t_start() -> Instant {
     Instant::now()
@@ -109,8 +163,34 @@ fn main() -> Result<()> {
             cmd_publisher_snapshot(logn, srs, block, universe_file, snapshot_vals, out)?
         }
 
-        Cmd::PublisherAdvance { logn, srs, dataset_dir, universe_file, snapshot, snapshot_vals, end_block, journal } => {
-            cmd_publisher_advance(logn, srs, dataset_dir, universe_file, snapshot, snapshot_vals, end_block, journal)?
+        Cmd::PublisherAdvance {
+            logn,
+            srs,
+            dataset_dir,
+            universe_file,
+            snapshot,
+            snapshot_vals,
+            end_block,
+            journal,
+            alpha_addresses,
+            proof_server_out,
+            block_log_csv,
+            cancel_path,
+        } => {
+            cmd_publisher_advance(
+                logn,
+                srs,
+                dataset_dir,
+                universe_file,
+                snapshot,
+                snapshot_vals,
+                end_block,
+                journal,
+                alpha_addresses,
+                proof_server_out,
+                block_log_csv,
+                cancel_path,
+            )?
         }
 
         Cmd::IssueUserState {
@@ -170,6 +250,9 @@ fn main() -> Result<()> {
         Cmd::UserVerify { logn, srs, user_state, history, claims } => {
             cmd_user_verify(logn, srs, user_state, history, claims)?
         }
+        Cmd::Daemon { logn, srs, r#in } => {
+            cmd_daemon(logn, srs, r#in)?
+        }
     }
 
     Ok(())
@@ -197,6 +280,55 @@ fn cmd_build_universe(dataset_dir: PathBuf, start_block: u64, end_block: u64, ou
     Ok(())
 }
 
+// /// Create initial publisher snapshot at given block
+// fn cmd_publisher_snapshot(
+//     logn: usize,
+//     srs: PathBuf,
+//     block: u64,
+//     universe_file: PathBuf,
+//     snapshot_vals_path: PathBuf,
+//     out: PathBuf,
+// ) -> Result<()> {
+//     let t0 = t_start();
+
+//     let n = 1usize << logn;
+//     let lc = get_loaded_ctx(logn, &srs)?;
+//     let ctx = &lc.ctx;
+//     let srs_id = lc.srs_id.clone();
+
+//     let universe = read_addresses_file(&universe_file)?;
+//     let bals = snapshot_vals::read_u256hex_lines(&snapshot_vals_path)?;
+//     if universe.len() != bals.len() {
+//         bail!("snapshot_vals length mismatch");
+//     }
+
+//     let indexer = Indexer::from_universe_sequential(&universe, n)?;
+
+//     let mut v = vec![Fr::ZERO; n];
+//     for (a, bal) in universe.into_iter().zip(bals.into_iter()) {
+//         let i = indexer.index_of(a)?;
+//         v[i] = fr_from_u256_exact(bal)?;
+//     }
+
+//     let (gc, _gq_full) = ctx.build_commitment(&v);
+
+//     let snap = SnapshotOut {
+//         block_number: block,
+//         n,
+//         logn,
+//         srs_id,
+//         gc_hex: g1_to_hex(&gc),
+//         universe_mode: "sequential".into(),
+//         balance_encoding: "fr_exact_from_u256".into(),
+//     };
+
+//     fs::write(&out, serde_json::to_vec_pretty(&snap)?)?;
+
+//     let micros = t_us(t0);
+//     let sz = fs::metadata(&out)?.len() as usize;
+//     emit("[PublisherSnapshot]", block, n, 0, sz, micros);
+//     Ok(())
+// }
 /// Create initial publisher snapshot at given block
 fn cmd_publisher_snapshot(
     logn: usize,
@@ -206,15 +338,28 @@ fn cmd_publisher_snapshot(
     snapshot_vals_path: PathBuf,
     out: PathBuf,
 ) -> Result<()> {
-    let t0 = t_start();
+    // Total (includes any init done inside this function)
+    let t_total = t_start();
 
     let n = 1usize << logn;
-    let (vp, srs_id) = load_or_create_srs(&srs, logn)?;
-    let ctx = make_ctx(&vp, logn);
+
+    // ---- ctx lookup (may trigger InitSRS+CtxOnce)
+    // Measure how long the ctx lookup/init took inside THIS call.
+    let t_ctx = t_start();
+    let lc = get_loaded_ctx(logn, &srs)?;
+    let ctx_us = t_us(t_ctx);
+
+    let ctx = &lc.ctx;
+    let srs_id = lc.srs_id.clone();
+
+    // From here on, this is the “snapshot work” excluding ctx init.
+    let t_snap_only = t_start();
 
     let universe = read_addresses_file(&universe_file)?;
+    let universe_len = universe.len();
+
     let bals = snapshot_vals::read_u256hex_lines(&snapshot_vals_path)?;
-    if universe.len() != bals.len() {
+    if universe_len != bals.len() {
         bail!("snapshot_vals length mismatch");
     }
 
@@ -240,9 +385,23 @@ fn cmd_publisher_snapshot(
 
     fs::write(&out, serde_json::to_vec_pretty(&snap)?)?;
 
-    let micros = t_us(t0);
-    let sz = fs::metadata(&out)?.len() as usize;
-    emit("[PublisherSnapshot]", block, n, 0, sz, micros);
+    // ---- metrics
+    let snap_only_us = t_us(t_snap_only);
+    let total_us = t_us(t_total);
+    let out_sz = fs::metadata(&out)?.len() as usize;
+
+    // This is the number you want for “snapshot generation time only”
+    emit("[PublisherSnapshotOnly]", block, n, 0, universe_len, snap_only_us);
+
+    // Optional: how long ctx lookup/init took inside this call
+    emit("[PublisherSnapshotCtxLookup]", block, n, 0, 0, ctx_us);
+
+    // Total end-to-end time (includes ctx lookup/init)
+    emit("[PublisherSnapshotTotal]", block, n, 0, out_sz, total_us);
+
+    // If you want to keep your old label too (optional; same as Total)
+    // emit("[PublisherSnapshot]", block, n, 0, out_sz, total_us);
+
     Ok(())
 }
 
@@ -256,13 +415,25 @@ fn cmd_publisher_advance(
     snapshot_vals_path: PathBuf,
     end_block: u64,
     journal: PathBuf,
+
+    // NEW
+    alpha_addresses: Option<PathBuf>,
+    // NEW
+    proof_server_out: Option<PathBuf>,
+    block_log_csv: Option<PathBuf>,
+    cancel_path: Option<PathBuf>,
 ) -> Result<()> {
     let n = 1usize << logn;
 
-    let (vp, srs_id) = load_or_create_srs(&srs, logn)?;
-    let ctx = make_ctx(&vp, logn);
+    let lc = get_loaded_ctx(logn, &srs)?;
+    let ctx = &lc.ctx;
+    let srs_id = lc.srs_id.clone();
 
-    let snap: SnapshotOut = serde_json::from_slice(&fs::read(snapshot)?)?;
+    let snap: SnapshotOut = serde_json::from_slice(&fs::read(&snapshot)?)?;
+    if snap.logn != logn || snap.srs_id != srs_id {
+        bail!("snapshot / srs mismatch");
+    }
+
     let universe = read_addresses_file(&universe_file)?;
     let indexer = Indexer::from_universe_sequential(&universe, n)?;
 
@@ -274,32 +445,178 @@ fn cmd_publisher_advance(
         &snapshot_vals_path,
     )?;
 
+    // publisher head commitment
     let mut gc = g1_from_hex(&snap.gc_hex)?;
     let mut cur = snap.block_number;
+    
+    let mut block_log: Option<std::fs::File> = match &block_log_csv {
+        Some(p) => {
+            let mut f = std::fs::File::create(p)?;
+            writeln!(f, "kind,block,start_ms,end_ms,wall_ms,proc_micros,beta")?;
+            Some(f)
+        }
+        None => None,
+    };
+    
+    // helper to write marker rows
+    let mut log_marker = |kind: &str| {
+        if let Some(f) = block_log.as_mut() {
+            let t = now_ms();
+            let _ = writeln!(f, "{},0,{},{},0,0,0", kind, t, t);
+        }
+    };
+    let mut ps_opt: Option<(ProofServerState, Vec<G1>)> = None;
+    
+    if let Some(alpha_path) = alpha_addresses.as_ref() {
+        // marker: alpha init starts (BEFORE expensive init)
+        log_marker("init_alpha_start");
+    
+        // Build alpha_indices from alpha.txt addresses
+        let addrs = read_addresses_file(alpha_path)?;
+        if addrs.is_empty() {
+            bail!("alpha_addresses file is empty");
+        }
+    
+        let mut set = std::collections::BTreeSet::new();
+        for a in addrs {
+            let i = indexer.index_of(a)?;
+            set.insert(i);
+        }
+        let alpha_indices: Vec<usize> = set.into_iter().collect();
+        let alpha_len = alpha_indices.len();
+    
+        // Build initial witnesses at snapshot
+        let bals = snapshot_vals::read_u256hex_lines(&snapshot_vals_path)?;
+        if bals.len() != universe.len() {
+            bail!("snapshot_vals length mismatch");
+        }
+    
+        let mut v = vec![Fr::ZERO; n];
+        for (a, bal) in universe.iter().zip(bals.into_iter()) {
+            let i = indexer.index_of(*a)?;
+            v[i] = fr_from_u256_exact(bal)?;
+        }
+    
+        let t_init = t_start();
+        let (gc_rebuilt, gq_alpha) = ctx.build_commitment_for_alpha(&v, &alpha_indices);
+    
+        if g1_to_hex(&gc_rebuilt) != snap.gc_hex {
+            bail!("rebuilt snapshot commitment mismatch (alpha init)");
+        }
+    
+        emit("[PublisherOnePassInitAlpha]", snap.block_number, n, alpha_len, 0, t_us(t_init));
+    
+        // marker: alpha init ends (AFTER init finished)
+        log_marker("init_alpha_end");
+    
+        let ps = ProofServerState {
+            n,
+            logn,
+            srs_id: srs_id.clone(),
+            last_block: snap.block_number,
+            gc_hex: snap.gc_hex.clone(),
+            alpha_indices,
+            alpha_witnesses_hex: gq_alpha.iter().map(g1_to_hex).collect(),
+            users: vec![],
+        };
+    
+        ps_opt = Some((ps, gq_alpha));
+    }
+    // let mut ps_opt: Option<(ProofServerState, Vec<G1>)> = None;
+
+    // if let Some(alpha_path) = alpha_addresses.as_ref() {
+    //     // Build alpha_indices from alpha.txt addresses
+    //     let addrs = read_addresses_file(alpha_path)?;
+    //     if addrs.is_empty() {
+    //         bail!("alpha_addresses file is empty");
+    //     }
+
+    //     let mut set = std::collections::BTreeSet::new();
+    //     for a in addrs {
+    //         let i = indexer.index_of(a)?;
+    //         set.insert(i);
+    //     }
+    //     let alpha_indices: Vec<usize> = set.into_iter().collect();
+    //     let alpha_len = alpha_indices.len();
+
+    //     // Build initial witnesses at snapshot using SAME method as IssueUserState
+    //     let bals = snapshot_vals::read_u256hex_lines(&snapshot_vals_path)?;
+    //     if bals.len() != universe.len() {
+    //         bail!("snapshot_vals length mismatch");
+    //     }
+
+    //     let mut v = vec![Fr::ZERO; n];
+    //     for (a, bal) in universe.iter().zip(bals.into_iter()) {
+    //         let i = indexer.index_of(*a)?;
+    //         v[i] = fr_from_u256_exact(bal)?;
+    //     }
+
+    //     let t_init = t_start();
+    //     let (gc_rebuilt, gq_alpha) = ctx.build_commitment_for_alpha(&v, &alpha_indices);
+
+    //     if g1_to_hex(&gc_rebuilt) != snap.gc_hex {
+    //         bail!("rebuilt snapshot commitment mismatch (alpha init)");
+    //     }
+    //     let mut block_log: Option<std::fs::File> = match &block_log_csv {
+    //         Some(p) => {
+    //             let mut f = std::fs::File::create(p)?;
+    //             // NEW: add a "kind" column + keep everything else
+    //             writeln!(f, "kind,block,start_ms,end_ms,wall_ms,proc_micros,beta")?;
+    //             Some(f)
+    //         }
+    //         None => None,
+    //     };
+        
+    //     log_marker("init_alpha_start", now_ms());
+
+    //     emit("[PublisherOnePassInitAlpha]", snap.block_number, n, alpha_len, 0, t_us(t_init));
+    //     log_marker("init_alpha_end", now_ms());
+
+    //     let ps = ProofServerState {
+    //         n,
+    //         logn,
+    //         srs_id: srs_id.clone(),
+    //         last_block: snap.block_number,
+    //         gc_hex: snap.gc_hex.clone(),
+    //         alpha_indices,
+    //         alpha_witnesses_hex: gq_alpha.iter().map(g1_to_hex).collect(),
+    //         users: vec![], // not needed for your one-pass maintenance
+    //     };
+
+    //     ps_opt = Some((ps, gq_alpha));
+    // }
 
     while cur < end_block {
+        if cancelled(cancel_path.as_deref()) {
+            eprintln!("publisher_advance cancelled at block {}", cur);
+            break;
+        }
+    
+        let start_ms = now_ms();
         let t0 = t_start();
-
+    
         let changes = tracker.apply_next_block()?;
         cur = tracker.cur_block;
-
+    
         let mut beta = Vec::new();
         let mut delta = Vec::new();
-
+    
         for (addr, old, new) in changes {
             let i = indexer.index_of(addr)?;
             beta.push(i);
             delta.push(delta_fr(new, old));
         }
-
+    
         let (beta, delta) = canonicalize_beta_delta(&beta, &delta);
-
+    
+        // commitment update
         let t1 = t_start();
         for (&i, &d) in beta.iter().zip(delta.iter()) {
             gc = ctx.update_commitment(gc, i, d);
         }
-        let t2 = t_us(t1);
-
+        let commit_us = t_us(t1);
+    
+        // journal append
         append_line(
             &journal,
             &JournalLine {
@@ -307,19 +624,55 @@ fn cmd_publisher_advance(
                 n,
                 logn,
                 srs_id: srs_id.clone(),
-                changed_indices: beta,
+                changed_indices: beta.clone(),
                 delta_hex: delta.iter().map(fr_to_hex).collect(),
-                gc_hex: Some(g1_to_hex(&gc)), // publisher pinned commitment
+                gc_hex: Some(g1_to_hex(&gc)),
             },
         )?;
-
-        emit("[PublisherAdvance] block", cur, n, 0, delta.len(), t_us(t0));
-        emit("[CommitUpdate] block", cur, n, 0, delta.len(), t2);
-    }
     
+        // witness update (optional)
+        if let Some((ps, gq)) = ps_opt.as_mut() {
+            let t_wit = t_start();
+            if !beta.is_empty() && !ps.alpha_indices.is_empty() {
+                *gq = ctx.update_witnesses_batch(&ps.alpha_indices, gq, &beta, &delta);
+            }
+            let wit_us = t_us(t_wit);
+    
+            ps.last_block = cur;
+            ps.gc_hex = g1_to_hex(&gc);
+            ps.alpha_witnesses_hex = gq.iter().map(g1_to_hex).collect();
+    
+            emit("[PublisherOnePassWitnessOnly] block", cur, n, ps.alpha_indices.len(), beta.len(), wit_us);
+        }
+    
+        // end-to-end timing
+        let proc_micros = t_us(t0);
+        let end_ms = now_ms();
+        let wall_ms = end_ms - start_ms;
+    
+        // keep your existing metrics
+        emit("[PublisherAdvance] block", cur, n, 0, beta.len(), proc_micros);
+        emit("[CommitUpdate] block", cur, n, 0, beta.len(), commit_us);
+    
+        // CSV log
+        if let Some(f) = block_log.as_mut() {
+            let _ = writeln!(
+                f,
+                "block,{},{},{},{},{},{}",
+                cur, start_ms, end_ms, wall_ms, proc_micros, beta.len()
+            );
+        }
+    }
+
+    // -----------------------------
+    // Write final proof server state (latest witnesses only)
+    // -----------------------------
+    if let (Some(out_path), Some((ps, _gq))) = (proof_server_out, ps_opt.as_ref()) {
+        fs::write(out_path, serde_json::to_vec_pretty(ps)?)?;
+    }
+
     Ok(())
 }
-
 /// Issue user state for given addresses at snapshot block
 fn cmd_issue_user_state(
     logn: usize,
@@ -333,8 +686,9 @@ fn cmd_issue_user_state(
     let t0 = t_start();
     let n = 1usize << logn;
 
-    let (vp, srs_id) = load_or_create_srs(&srs, logn)?;
-    let ctx = make_ctx(&vp, logn);
+    let lc = get_loaded_ctx(logn, &srs)?;
+    let ctx = &lc.ctx;
+    let srs_id = lc.srs_id.clone();
 
     let snap: SnapshotOut = serde_json::from_slice(&fs::read(&snapshot)?)?;
     if snap.logn != logn || snap.srs_id != srs_id {
@@ -421,7 +775,8 @@ fn cmd_proof_server_init(
         bail!("--user-id and --user-state length mismatch");
     }
 
-    let (_vp, srs_id) = load_or_create_srs(&srs, logn)?;
+    let lc = get_loaded_ctx(logn, &srs)?;
+    let srs_id = lc.srs_id.clone();
     let snap: SnapshotOut = serde_json::from_slice(&fs::read(&snapshot)?)?;
 
     if snap.srs_id != srs_id || snap.logn != logn {
@@ -459,8 +814,10 @@ fn cmd_proof_server_advance(
 ) -> Result<()> {
     let mut ps: ProofServerState = serde_json::from_slice(&fs::read(&proof_server_state)?)?;
 
-    let (vp, _) = load_or_create_srs(&srs, logn)?;
-    let ctx = make_ctx(&vp, logn);
+    let lc = get_loaded_ctx(logn, &srs)?;
+    let ctx = &lc.ctx;
+
+    let srs_id = ps.srs_id.clone();
 
     let mut gc: G1 = g1_from_hex(&ps.gc_hex)?;
     let mut gq: Vec<G1> = ps.alpha_witnesses_hex.iter().map(|h| g1_from_hex(h)).collect::<Result<Vec<_>>>()?;
@@ -470,7 +827,6 @@ fn cmd_proof_server_advance(
     }
 
     let start_block = ps.last_block;
-    let srs_id = ps.srs_id.clone();
     let n = ps.n;
     let logn_ps = ps.logn;
 
@@ -606,6 +962,53 @@ fn cancelled(cancel: Option<&std::path::Path>) -> bool {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+enum DaemonReq {
+    PublisherAdvance {
+        dataset_dir: PathBuf,
+        universe_file: PathBuf,
+        snapshot: PathBuf,
+        snapshot_vals: PathBuf,
+        end_block: u64,
+        journal: PathBuf,
+        alpha_addresses: Option<PathBuf>,
+        proof_server_out: Option<PathBuf>,
+        block_log_csv: Option<PathBuf>,
+        cancel_path: Option<PathBuf>,
+    },
+    ProofServerAdvance {
+        proof_server_state: PathBuf,
+        journal: PathBuf,
+        end_block: u64,
+        out: PathBuf,
+    },
+    ProofServerHistory {
+        proof_server_state: PathBuf,
+        journal: PathBuf,
+        start_block: u64,
+        blocks: Vec<u64>,
+        user_id: String,
+        out: PathBuf,
+
+        // optional per-request log + cancel, same as your history-server style
+        log: Option<PathBuf>,
+        req_id: Option<String>,
+        cancel_path: Option<PathBuf>,
+    },
+    UserVerify {
+        user_state: PathBuf,
+        history: PathBuf,
+        claims: Option<PathBuf>,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct DaemonResp {
+    ok: bool,
+    err: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
 struct HistoryReq {
     start_block: u64,
     blocks: Vec<u64>,
@@ -637,21 +1040,14 @@ fn cmd_proof_server_history(
 
     // Load SRS + build ctx
     let t_ctx = t_start();
-    let (vp, _srs_id) = load_or_create_srs(&srs, logn)?;
-    let ctx = make_ctx(&vp, logn);
-    emit(
-        "[HistoryOneShotInitSRS+Ctx]",
-        ps.last_block,
-        ps.n,
-        ps.alpha_indices.len(),
-        0,
-        t_us(t_ctx),
-    );
+    let lc = get_loaded_ctx(logn, &srs)?;
+    let ctx = &lc.ctx;
+    emit("[HistoryCtxLookup]", ps.last_block, ps.n, ps.alpha_indices.len(), 0, t_us(t_ctx));
 
     // Run core logic
     let t_core = t_start();
     proof_server_history_core(
-        &ctx,
+        ctx,
         &ps,
         &journal,
         start_block,
@@ -680,7 +1076,7 @@ fn cmd_proof_server_history(
     Ok(())
 }
 
-fn proof_server_history_core(
+pub fn proof_server_history_core(
     ctx: &VcContext,
     ps: &ProofServerState,
     journal: &std::path::Path,
@@ -861,6 +1257,7 @@ fn proof_server_history_core(
         user_id: user_id.clone(),
         block: b,
         indices: user_alpha.clone(),
+        values_hex: vec![],
         witnesses_hex: wits.iter().map(g1_to_hex).collect(),
         gc_hex,
     });
@@ -889,9 +1286,10 @@ fn cmd_proof_server_history_server(
 
     let t_srs = t_start();
     let ps: ProofServerState = serde_json::from_slice(&std::fs::read(&proof_server_state)?)?;
-    let (vp, _srs_id) = load_or_create_srs(&srs, logn)?;
-    let ctx = make_ctx(&vp, logn);
-    emit("[HistoryServerInitSRS+Ctx]", ps.last_block, ps.n, ps.alpha_indices.len(), 0, t_us(t_srs));
+   let lc = get_loaded_ctx(logn, &srs)?;
+    let ctx = &lc.ctx;
+    
+    emit("[HistoryServerCtxLookup]", ps.last_block, ps.n, ps.alpha_indices.len(), 0, t_us(t_srs));
 
     eprintln!("history-server ready: head_block={}", ps.last_block);
 
@@ -929,7 +1327,7 @@ fn cmd_proof_server_history_server(
 
         let t_req = t_start();
         let r = proof_server_history_core_with_log(
-            &ctx,
+            ctx,
             &ps,
             &journal,
             req.start_block,
@@ -1046,17 +1444,20 @@ fn cmd_user_verify(
         bail!("user_state logn mismatch");
     }
 
-    let t_srs = t_start();
-    let (vp, srs_id) = load_or_create_srs(&srs, logn)?;
-    let srs_us = t_us(t_srs);
+    let t_lookup = t_start();
+    let lc = get_loaded_ctx(logn, &srs)?;
+    let ctx = &lc.ctx;
+    let vp  = &lc.vp;
+    let srs_id = &lc.srs_id;
+    let lookup_us = t_us(t_lookup);
+    
+    // Optional: keep a metric, but it's now "lookup", not "load"
+    emit("[UserVerifyCtxLookup]", 0, 0, 0, 0, lookup_us);
 
-    emit("[UserVerifySRSLoad]", 0, 0, 0, 0, srs_us);
-
-    if us.srs_id != srs_id {
+    if us.srs_id != *srs_id {
         bail!("SRS id mismatch user_state ({}) vs srs.bin ({})", us.srs_id, srs_id);
     }
-    let ctx = make_ctx(&vp, logn);
-    let n = 1usize << logn;
+    let _n = 1usize << logn;
     let mut claim_map: HashMap<u64, Vec<Fr>> = HashMap::new();
     if let Some(p) = claims {
         let v: Vec<ValueClaim> = serde_json::from_slice(&fs::read(&p)?)?;
@@ -1074,9 +1475,9 @@ fn cmd_user_verify(
         );
     }
 
-    let mut total_alpha = 0usize;
-    let mut proofs = 0usize;
-    let t_total = t_start();
+    let _total_alpha = 0usize;
+    let _proofs = 0usize;
+    let _t_total = t_start();
 for h in hist {
     if h.indices != us.alpha_indices {
         bail!("history indices != user_state alpha_indices at block {}", h.block);
@@ -1123,8 +1524,8 @@ for h in hist {
     // α = 1 → single-proof verification
     if h.indices.len() == 1 {
         bench_verify_single_only(
-            &ctx,
-            &vp,
+            ctx,
+            vp,
             gc,
             h.indices[0],
             vals[0],
@@ -1134,8 +1535,8 @@ for h in hist {
 
     // α ≥ 1 → multi-proof (aggregate + verify)
     bench_verify_multi_only(
-        &ctx,
-        &vp,
+        ctx,
+        vp,
         gc,
         &h.indices,
         vals,
@@ -1222,3 +1623,75 @@ fn cmd_extract_value(
     Ok(())
 }
 
+fn cmd_daemon(logn: usize, srs: PathBuf, in_path: Option<PathBuf>) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::{self, BufRead};
+
+    // Force single init now (so first request isn't charged)
+    let _ = get_loaded_ctx(logn, &srs)?;
+
+    let reader: Box<dyn BufRead> = if let Some(p) = in_path {
+        let f = OpenOptions::new().read(true).write(true).open(p)?;
+        Box::new(io::BufReader::new(f))
+    } else {
+        Box::new(io::BufReader::new(io::stdin()))
+    };
+
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() { continue; }
+
+        let req: DaemonReq = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("{}", serde_json::to_string(&DaemonResp{ ok:false, err:Some(e.to_string()) })?);
+                continue;
+            }
+        };
+
+        let r: Result<()> = match req {
+            DaemonReq::PublisherAdvance {
+                dataset_dir,
+                universe_file,
+                snapshot,
+                snapshot_vals,
+                end_block,
+                journal,
+                alpha_addresses,
+                proof_server_out,
+                block_log_csv,
+                cancel_path,
+            } => cmd_publisher_advance(
+                logn,
+                srs.clone(),
+                dataset_dir,
+                universe_file,
+                snapshot,
+                snapshot_vals,
+                end_block,
+                journal,
+                alpha_addresses,
+                proof_server_out,
+                block_log_csv,
+                cancel_path,
+            ),
+          
+            DaemonReq::ProofServerAdvance { proof_server_state, journal, end_block, out } =>
+                cmd_proof_server_advance(logn, srs.clone(), proof_server_state, journal, end_block, out),
+          
+            DaemonReq::ProofServerHistory { proof_server_state, journal, start_block, blocks, user_id, out, .. } =>
+                cmd_proof_server_history(logn, srs.clone(), proof_server_state, journal, start_block, blocks, user_id, out),
+          
+            DaemonReq::UserVerify { user_state, history, claims } =>
+                cmd_user_verify(logn, srs.clone(), user_state, history, claims),
+          };
+
+        match r {
+            Ok(()) => println!("{}", serde_json::to_string(&DaemonResp{ ok:true, err:None })?),
+            Err(e) => println!("{}", serde_json::to_string(&DaemonResp{ ok:false, err:Some(format!("{:?}", e)) })?),
+        }
+    }
+
+    Ok(())
+}

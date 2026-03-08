@@ -12,5 +12,9 @@ pub mod proof_server;
 pub mod snapshot_vals;
 pub mod srs;
 pub mod types;
+pub mod history_api;
+pub mod proof_history_core;
+pub use proof_history_core::proof_server_history_core;
+pub mod grpc_api;
 
 pub use types::*;
