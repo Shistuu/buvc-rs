@@ -448,7 +448,10 @@ fn cmd_publisher_advance(
     // publisher head commitment
     let mut gc = g1_from_hex(&snap.gc_hex)?;
     let mut cur = snap.block_number;
-    
+    let mut blocks_processed: usize = 0;
+    let mut total_commit_us: u128 = 0;
+    let mut total_witness_us: u128 = 0;
+    let mut total_proc_us: u128 = 0;
     let mut block_log: Option<std::fs::File> = match &block_log_csv {
         Some(p) => {
             let mut f = std::fs::File::create(p)?;
@@ -615,6 +618,7 @@ fn cmd_publisher_advance(
             gc = ctx.update_commitment(gc, i, d);
         }
         let commit_us = t_us(t1);
+        total_commit_us += commit_us;
     
         // journal append
         append_line(
@@ -637,6 +641,7 @@ fn cmd_publisher_advance(
                 *gq = ctx.update_witnesses_batch(&ps.alpha_indices, gq, &beta, &delta);
             }
             let wit_us = t_us(t_wit);
+            total_witness_us += wit_us;
     
             ps.last_block = cur;
             ps.gc_hex = g1_to_hex(&gc);
@@ -647,6 +652,8 @@ fn cmd_publisher_advance(
     
         // end-to-end timing
         let proc_micros = t_us(t0);
+        total_proc_us += proc_micros;
+        blocks_processed += 1;
         let end_ms = now_ms();
         let wall_ms = end_ms - start_ms;
     
@@ -670,6 +677,32 @@ fn cmd_publisher_advance(
     if let (Some(out_path), Some((ps, _gq))) = (proof_server_out, ps_opt.as_ref()) {
         fs::write(out_path, serde_json::to_vec_pretty(ps)?)?;
     }
+    emit(
+    "[PublisherAdvanceCommitTotal]",
+    cur,
+    n,
+    ps_opt.as_ref().map(|(ps, _)| ps.alpha_indices.len()).unwrap_or(0),
+    blocks_processed,
+    total_commit_us,
+);
+
+emit(
+    "[PublisherAdvanceWitnessTotal]",
+    cur,
+    n,
+    ps_opt.as_ref().map(|(ps, _)| ps.alpha_indices.len()).unwrap_or(0),
+    blocks_processed,
+    total_witness_us,
+);
+
+emit(
+    "[PublisherAdvanceProcTotal]",
+    cur,
+    n,
+    ps_opt.as_ref().map(|(ps, _)| ps.alpha_indices.len()).unwrap_or(0),
+    blocks_processed,
+    total_proc_us,
+);
 
     Ok(())
 }
